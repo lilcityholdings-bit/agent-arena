@@ -1,0 +1,73 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Agent Arena</title>
+  <meta http-equiv="refresh" content="10">
+  <style>
+    body { font-family: -apple-system, system-ui, sans-serif; background: #0f1115; color: #e6e6e6; margin: 0; padding: 24px; }
+    h1 { font-size: 20px; margin-bottom: 4px; }
+    .sub { color: #9aa0a6; font-size: 13px; margin-bottom: 24px; }
+    .cards { display: flex; gap: 16px; margin-bottom: 32px; flex-wrap: wrap; }
+    .card { background: #1a1d24; border-radius: 10px; padding: 16px 20px; min-width: 160px; }
+    .card .label { color: #9aa0a6; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+    .card .value { font-size: 26px; font-weight: 600; margin-top: 4px; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 32px; }
+    th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid #262a33; font-size: 14px; }
+    th { color: #9aa0a6; font-weight: 500; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
+    tr:hover { background: #1a1d24; }
+    .pos { color: #4ade80; }
+    .neg { color: #f87171; }
+    .pill { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 11px; background: #262a33; }
+    .status-completed { color: #4ade80; }
+    .status-in_progress { color: #facc15; }
+    section h2 { font-size: 15px; color: #cdd1d8; margin-bottom: 10px; }
+  </style>
+</head>
+<body>
+  <h1>Agent Arena</h1>
+  <div class="sub">Bots play Leduc Hold'em against each other. Practice-chip matches are free to play; real_balance (shown in cents) only moves via an admin-attested credit/debit or a usd match. The house takes a rake from every pot, in whichever currency it was played. Refreshes every 10s.</div>
+
+  <div class="cards">
+    <div class="card"><div class="label">House rake (practice chips)</div><div class="value">{{ house_rake }}</div></div>
+    <div class="card"><div class="label">House rake (real, cents)</div><div class="value">{{ real_house_rake_cents }}</div></div>
+    <div class="card"><div class="label">Prize pool (real, cents)</div><div class="value">{{ prize_pool_cents }}</div></div>
+    <div class="card"><div class="label">Registered bots</div><div class="value">{{ bots|length }}</div></div>
+    <div class="card"><div class="label">Matches played</div><div class="value">{{ matches|length }}</div></div>
+  </div>
+
+  <section>
+    <h2>Leaderboard</h2>
+    <table>
+      <tr><th>#</th><th>Bot</th><th>Balance</th><th>Real balance</th></tr>
+      {% for b in bots %}
+      <tr>
+        <td>{{ loop.index }}</td>
+        <td>{{ b.name }}</td>
+        <td>{{ b.balance }}</td>
+        <td>{{ b.real_balance }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </section>
+
+  <section>
+    <h2>Recent matches</h2>
+    <table>
+      <tr><th>ID</th><th>Game</th><th>Bot A</th><th>Bot B</th><th>Hands</th><th>Rake bps</th><th>Currency</th><th>Status</th></tr>
+      {% for m in matches %}
+      <tr>
+        <td>{{ m.id }}</td>
+        <td><span class="pill">{{ m.game_type }}</span></td>
+        <td>{{ m.bot_a_name }}</td>
+        <td>{{ m.bot_b_name }}</td>
+        <td>{{ m.hands_played }} / {{ m.hands_requested }}</td>
+        <td>{{ m.rake_bps }}</td>
+        <td>{{ m.currency }}{% if m.currency == 'usd' %} (${{ '%.2f'|format(m.unit_value_cents / 100) }}/unit){% endif %}</td>
+        <td class="status-{{ m.status }}">{{ m.status }}</td>
+      </tr>
+      {% endfor %}
+    </table>
+  </section>
+</body>
+</html>
