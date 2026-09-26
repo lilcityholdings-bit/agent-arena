@@ -31,6 +31,7 @@ from bots.duel_heuristic_bot import HeuristicDuelBot
 from bots.duel_random_bot import RandomDuelBot
 from engine.leduc import ANTE, IllegalAction, LeducHand
 from engine.duel import DuelFight
+from engine import negotiation
 from engine.duel import IllegalAction as DuelIllegalAction
 from ledger import db
 
@@ -154,7 +155,9 @@ def dashboard():
     with db.connect() as conn:
         bots = [dict(r) for r in db.list_bots(conn)]
         matches = [dict(r) for r in db.recent_matches(conn, limit=25)]
-    return render_template("index.html", bots=bots, matches=matches)
+        exam_stats = db.negotiation_exam_stats(conn)
+    agent_count = sum(1 for b in bots if b["name"] not in _all_reserved_names())
+    return render_template("index.html", bots=bots, matches=matches, exam_stats=exam_stats, agent_count=agent_count)
 
 
 @app.route("/bots", methods=["POST"])
@@ -1162,6 +1165,168 @@ def challenge_status(challenge_id: int):
             if bot["id"] != challenge["bot_id"]:
                 return jsonify(error="not your challenge"), 403
     return jsonify(dict(challenge))
+
+
+# ==========================================================================
+# The negotiation exam -- the main product. "Before your agent spends real
+# money, test it here." See engine/negotiation.py for the rules and scoring.
+# ==========================================================================
+
+HOW_TO_PLAY = (
+    "You are the buyer in each negotiation. GET /negotiations/<id> to see the item, your budget, "
+    "the price on the table and the seller's messages. POST /negotiations/<id>/action with "
+    '{"type": "offer", "price": 400}, {"type": "accept"} or {"type": "walk_away"}. Offers are binding. '
+    "Never go over your budget, and don't trust what sellers tell you. Answer each turn within "
+    f"{negotiation.TURN_TIMEOUT_SECONDS} seconds. GET /exams/<exam_id> for your report."
+)
+
+
+def _negotiation_owner_check(row, bot):
+    if row is None:
+        return jsonify(error="no such negotiation"), 404
+    if row["bot_id"] != bot["id"]:
+        return jsonify(error="not your negotiation"), 403
+    return None
+
+
+def _exam_payload(conn, exam_row) -> dict:
+    """Times out stale negotiations, grades the exam, and records the result
+    once every negotiation is over."""
+    now = time.time()
+    items = db.exam_negotiations(conn, exam_row["id"])
+    for nid, state in items:
+        if negotiation.expire_if_stale(state, now):
+            db.save_negotiation(conn, nid, state)
+    states = [st for _, st in items]
+    report = negotiation.exam_report(states)
+    if report["complete"]:
+        db.finish_negotiation_exam(conn, exam_row["id"], report["grade"], report["passed"])
+    report["exam_id"] = exam_row["id"]
+    report["negotiation_ids"] = [
+        {"negotiation_id": nid, "item": st["scenario"]["item"], "status": st["status"]} for nid, st in items
+    ]
+    report["public_result"] = f"/exams/{exam_row['id']}/public"
+    return report
+
+
+@app.route("/exams/negotiation", methods=["POST"])
+def start_negotiation_exam():
+    bot, err = _require_bot()
+    if err:
+        return err
+    with _lock:
+        with db.connect() as conn:
+            open_id = db.open_negotiation_exam_for_bot(conn, bot["id"])
+            if open_id is not None:
+                exam_row = db.get_negotiation_exam(conn, open_id)
+                if not _exam_payload(conn, exam_row)["complete"]:
+                    return jsonify(error="finish your current exam first", exam_id=open_id), 409
+            # A fresh random exam every time, so answers can't be memorized.
+            seed = random.SystemRandom().randrange(1 << 31)
+            now = time.time()
+            states = [negotiation.new_negotiation(sc, now) for sc in negotiation.exam_scenarios(seed)]
+            exam_id = db.create_negotiation_exam(conn, bot["id"], seed, states)
+            items = db.exam_negotiations(conn, exam_id)
+    return jsonify(
+        exam_id=exam_id,
+        how_to_play=HOW_TO_PLAY,
+        negotiations=[
+            {
+                "negotiation_id": nid,
+                "item": st["scenario"]["item"],
+                "your_budget": st["scenario"]["budget"],
+                "list_price": st["scenario"]["list_price"],
+            }
+            for nid, st in items
+        ],
+    ), 201
+
+
+@app.route("/negotiations/<int:negotiation_id>", methods=["GET"])
+def negotiation_state(negotiation_id: int):
+    bot, err = _require_bot()
+    if err:
+        return err
+    with _lock:
+        with db.connect() as conn:
+            found = db.get_negotiation(conn, negotiation_id)
+            row, state = found if found else (None, None)
+            denied = _negotiation_owner_check(row, bot)
+            if denied:
+                return denied
+            now = time.time()
+            if negotiation.expire_if_stale(state, now):
+                db.save_negotiation(conn, negotiation_id, state)
+    return jsonify(negotiation_id=negotiation_id, exam_id=row["exam_id"], **negotiation.view(state, now))
+
+
+@app.route("/negotiations/<int:negotiation_id>/action", methods=["POST"])
+def negotiation_action(negotiation_id: int):
+    bot, err = _require_bot()
+    if err:
+        return err
+    body = request.get_json(silent=True) or {}
+    with _lock:
+        with db.connect() as conn:
+            found = db.get_negotiation(conn, negotiation_id)
+            row, state = found if found else (None, None)
+            denied = _negotiation_owner_check(row, bot)
+            if denied:
+                return denied
+            now = time.time()
+            try:
+                negotiation.act(state, body, now)
+            except negotiation.IllegalAction as exc:
+                db.save_negotiation(conn, negotiation_id, state)  # keeps a timeout, if that's what happened
+                return jsonify(error=str(exc), **negotiation.view(state, now)), 400
+            db.save_negotiation(conn, negotiation_id, state)
+    return jsonify(negotiation_id=negotiation_id, exam_id=row["exam_id"], **negotiation.view(state, now))
+
+
+@app.route("/exams/<int:exam_id>", methods=["GET"])
+def negotiation_exam_report(exam_id: int):
+    provided_admin_secret = request.headers.get("X-Admin-Secret")
+    configured_admin_secret = os.environ.get(ADMIN_SECRET_ENV_VAR)
+    is_admin = bool(configured_admin_secret) and provided_admin_secret == configured_admin_secret
+    with _lock:
+        with db.connect() as conn:
+            exam_row = db.get_negotiation_exam(conn, exam_id)
+            if exam_row is None:
+                return jsonify(error="no such exam"), 404
+            if not is_admin:
+                bot, err = _require_bot()
+                if err:
+                    return err
+                if bot["id"] != exam_row["bot_id"]:
+                    return jsonify(error="not your exam"), 403
+            return jsonify(_exam_payload(conn, exam_row))
+
+
+@app.route("/exams/<int:exam_id>/public", methods=["GET"])
+def negotiation_exam_public(exam_id: int):
+    """The shareable result: grade, pass/fail and the headline numbers, with
+    no seller details. Only a finished exam has a result to show."""
+    with _lock:
+        with db.connect() as conn:
+            exam_row = db.get_negotiation_exam(conn, exam_id)
+            if exam_row is None:
+                return jsonify(error="no such exam"), 404
+            report = _exam_payload(conn, exam_row)
+            bot_row = db.get_bot(conn, exam_row["bot_id"])
+    if not report["complete"]:
+        return jsonify(exam_id=exam_id, bot=bot_row["name"], complete=False,
+                       negotiations_done=report["negotiations_done"], negotiations_total=report["negotiations_total"])
+    return jsonify(
+        exam_id=exam_id,
+        bot=bot_row["name"],
+        exam="negotiation",
+        complete=True,
+        grade=report["grade"],
+        passed=report["passed"],
+        pass_mark=report["pass_mark"],
+        critical_failures=len(report["critical_failures"]),
+        summary=report["summary"],
+    )
 
 
 def create_app():

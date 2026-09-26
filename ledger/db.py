@@ -197,6 +197,28 @@ CREATE TABLE IF NOT EXISTS prize_pool_transactions (
     challenge_id INTEGER REFERENCES boss_challenges(id),
     created_at REAL NOT NULL
 );
+
+-- The negotiation exam (engine/negotiation.py): one row per exam, one row per
+-- negotiation in it. A negotiation's whole state is JSON, written on every
+-- turn, so an exam survives a restart the same way a live match does.
+CREATE TABLE IF NOT EXISTS negotiation_exams (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_id INTEGER NOT NULL REFERENCES bots(id),
+    seed INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    finished_at REAL,
+    grade INTEGER,
+    passed INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS negotiations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    exam_id INTEGER NOT NULL REFERENCES negotiation_exams(id),
+    bot_id INTEGER NOT NULL REFERENCES bots(id),
+    position INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
 """
 
 
@@ -569,3 +591,60 @@ def ensure_minimum_practice_balance(conn: sqlite3.Connection, bot_id: int, minim
         conn.execute("UPDATE bots SET balance = ? WHERE id = ?", (minimum, bot_id))
 
 
+# ---- negotiation exams --------------------------------------------------------------------
+
+def create_negotiation_exam(conn: sqlite3.Connection, bot_id: int, seed: int, states: list[dict]) -> int:
+    now = time.time()
+    exam_id = conn.execute(
+        "INSERT INTO negotiation_exams (bot_id, seed, created_at) VALUES (?, ?, ?)", (bot_id, seed, now)
+    ).lastrowid
+    for position, state in enumerate(states, 1):
+        conn.execute(
+            "INSERT INTO negotiations (exam_id, bot_id, position, state_json, updated_at) VALUES (?, ?, ?, ?, ?)",
+            (exam_id, bot_id, position, json.dumps(state), now),
+        )
+    return exam_id
+
+
+def get_negotiation_exam(conn: sqlite3.Connection, exam_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM negotiation_exams WHERE id = ?", (exam_id,)).fetchone()
+
+
+def open_negotiation_exam_for_bot(conn: sqlite3.Connection, bot_id: int) -> int | None:
+    row = conn.execute(
+        "SELECT id FROM negotiation_exams WHERE bot_id = ? AND finished_at IS NULL ORDER BY id DESC LIMIT 1", (bot_id,)
+    ).fetchone()
+    return row["id"] if row else None
+
+
+def exam_negotiations(conn: sqlite3.Connection, exam_id: int) -> list[tuple[int, dict]]:
+    rows = conn.execute(
+        "SELECT id, state_json FROM negotiations WHERE exam_id = ? ORDER BY position", (exam_id,)
+    ).fetchall()
+    return [(r["id"], json.loads(r["state_json"])) for r in rows]
+
+
+def get_negotiation(conn: sqlite3.Connection, negotiation_id: int) -> tuple[sqlite3.Row, dict] | None:
+    row = conn.execute("SELECT * FROM negotiations WHERE id = ?", (negotiation_id,)).fetchone()
+    return (row, json.loads(row["state_json"])) if row else None
+
+
+def save_negotiation(conn: sqlite3.Connection, negotiation_id: int, state: dict) -> None:
+    conn.execute(
+        "UPDATE negotiations SET state_json = ?, updated_at = ? WHERE id = ?",
+        (json.dumps(state), time.time(), negotiation_id),
+    )
+
+
+def finish_negotiation_exam(conn: sqlite3.Connection, exam_id: int, grade: int, passed: bool) -> None:
+    conn.execute(
+        "UPDATE negotiation_exams SET finished_at = ?, grade = ?, passed = ? WHERE id = ? AND finished_at IS NULL",
+        (time.time(), grade, int(passed), exam_id),
+    )
+
+
+def negotiation_exam_stats(conn: sqlite3.Connection) -> dict:
+    row = conn.execute(
+        "SELECT COUNT(finished_at) AS finished, COALESCE(SUM(passed), 0) AS passed FROM negotiation_exams"
+    ).fetchone()
+    return {"finished": row["finished"], "passed": row["passed"]}
