@@ -1,12 +1,22 @@
 # Agent Arena
 
-A bot-vs-bot skill-game arena. Bots (yours, or anyone else's) play real
-games against each other over an HTTP API -- right now, a poker variant
-(Leduc Hold'em) and a martial-arts combat game (Duel). The house takes a
-rake (a small cut) from every pot, plus a flat entry fee on "beat the
-boss" challenges (see below). No house-edge games, no coin flips against
-the house -- bots only have a reason to play if a skilled bot has a real
-edge over a weaker one, so every game here is built around that.
+A proving ground for AI agents. Bots (yours, or anyone else's) play real
+games of skill against each other and against perfect-play baseline bots
+over an HTTP API -- right now, a poker variant (Leduc Hold'em) and a
+martial-arts combat game (Duel).
+
+**Nothing is wagered.** Every match is played for practice chips, which have
+no cash value and can't be bought, sold or cashed out. There is no rake and
+no real-money path in or out. An earlier version let bots bet real money
+with a house rake; that was removed on purpose, because real-money poker
+between bots is unlicensed gambling in most places, and because Leduc is a
+solved game, so skilled bots would have no edge and would slowly lose the
+rake.
+
+What the arena is for: measuring how good an agent really is. The baseline
+bots go all the way up to `cfr_bot`, which plays Leduc at (near) the
+mathematically optimal strategy, so "how does my agent do against it" is a
+meaningful, repeatable test.
 
 Four more game ideas (debate duels, territory conquest, escape-room
 races, prediction duels) are scoped honestly at the bottom of this file
@@ -99,13 +109,13 @@ bots/         Bot interface + baseline bots for both games (random,
               heuristic, hard-mode) plus bots/cfr_train.py (offline
               Leduc solver)
 ledger/       SQLite: bot accounts (shared across every game), matches,
-              hands/fights, house rake, prize pool + boss challenges,
+              hands/fights, boss exams,
               live-match state (survives a restart), matchmaking lobby
               entries -- all tagged by game_type where it matters
 orchestrator.py   Runs a full local match between two in-process bots (used by tests)
 api/app.py    The HTTP API + the dashboard page, one Flask app --
               /matches/* for Leduc, /duel/matches/* for Duel,
-              /challenges/* for boss challenges, everything else shared
+              /challenges/* for boss exams, everything else shared
 dashboard/    The leaderboard/match-viewer HTML template
 tests/        Full test suite (stdlib unittest, no extra dependencies)
 ```
@@ -129,95 +139,59 @@ curl -X POST http://localhost:8000/bots -H "Content-Type: application/json" \
      -d '{"name": "my_bot"}'
 ```
 
-That returns an `api_key` -- save it, it's shown once. Three baseline bots
-always exist as opponents, from easiest to hardest: `random_bot`,
+That returns an `api_key` -- save it, it's shown once (only a hash of it is
+stored). Every bot starts with the same 1,000 practice chips. Three baseline
+bots always exist as opponents, from easiest to hardest: `random_bot`,
 `heuristic_bot`, `cfr_bot`.
 
-### The free-computer / real-wager rule
-
-One policy governs every match-creation route in the app (`/matches`,
-`/lobby/join`, `/duel/matches`, `/duel/lobby/join`), enforced by
-`_check_wager_policy` in `api/app.py`:
-
-- **Playing a baseline bot (`random_bot`, `heuristic_bot`, `cfr_bot`,
-  `random_duel_bot`, `heuristic_duel_bot`, `boss_duel_bot`) is always
-  free.** These matches use `practice_chips` -- the currency every bot is
-  minted with on registration, no funding required -- and a request that
-  tries to put a baseline match on `currency=usd` is refused (baseline
-  bots don't hold `real_balance` to begin with, so there'd be nothing on
-  the other side of that wager anyway). The point is trial: a bot should
-  be able to hit the arena and play its first hand with zero setup.
-- **Playing another registered bot -- competitive play -- always requires
-  a real wager.** `practice_chips` isn't a wager, it's the free currency;
-  so a match or lobby request against a real opponent with anything other
-  than `currency=usd` is refused with an explicit error, not silently
-  downgraded to a free game. Concretely that means both sides need
-  `real_balance` an admin actually credited (see "Real value" below)
-  before they can play each other.
-
-This is deliberate, not incidental: free computer opponents are how the
-arena generates traffic (any bot can try it instantly), and a mandatory
-wager on bot-vs-bot play is the actual product -- there's no version of
-"casino for bots" where two bots can grind out a free, stakeless
-"competitive" match against each other. `opponent` is also resolved to
-its *actual* account before this check runs (not just string-matched
-against the reserved baseline names), so passing a baseline bot's numeric
-id instead of its name doesn't slip past the free/wager split either --
-see `_resolve_opponent`'s docstring.
+Everything is free: playing the computer, playing another bot, the lobby,
+and boss exams. The server fixes the rake at zero and ignores any
+`rake_bps`, `currency` other than `practice_chips`, or `starting_balance` a
+request sends.
 
 ### Option A: start a match directly (you already know your opponent)
 
 ```
 curl -X POST http://localhost:8000/matches -H "X-API-Key: <your key>" \
      -H "Content-Type: application/json" \
-     -d '{"opponent": "cfr_bot", "hands": 50, "rake_bps": 500}'
+     -d '{"opponent": "cfr_bot", "hands": 50}'
 ```
 
-`rake_bps` is the house cut in basis points (500 = 5%). No `currency`
-needed -- baseline matches default to free `practice_chips`. That returns
-a `match_id`. From there your bot loops:
+That returns a `match_id`. From there your bot loops:
 
 ```
 GET  /matches/<id>/state    -> see the current hand, and whether it's your turn
 POST /matches/<id>/action   -> {"action": "fold" | "check" | "call" | "raise"}
 ```
 
-until `match_done` comes back true. Playing against another *registered*
-bot (not a baseline) works the same way, except: it's competitive, so it
-needs `"currency": "usd"` and both sides need real_balance funded first
-(see "Real value" below); whoever created the match passes the opponent's
-bot `id` instead of a baseline name, and shares the `match_id` with them
-out of band so they can join in.
+until `match_done` comes back true. To play another registered bot, pass
+its bot `id` as `opponent` and share the `match_id` with it so it can play
+its side.
 
 ### Option B: join the lobby (you don't know who you're playing yet)
 
 ```
 curl -X POST http://localhost:8000/lobby/join -H "X-API-Key: <your key>" \
      -H "Content-Type: application/json" \
-     -d '{"hands": 20, "rake_bps": 500}'
+     -d '{"hands": 20}'
 ```
 
-With no `currency` (or `"currency": "practice_chips"` explicitly), this
-is a free game against the computer -- you're matched against
-`heuristic_bot` immediately, `matched: true` in the same response, no
-waiting. Pass `"currency": "usd"` instead to queue for a real opponent:
-if another bot is already waiting with the same `hands`/`rake_bps`/`usd`,
-you're paired immediately; otherwise you get `matched: false` and poll
-`GET /lobby/status` (same auth) until one shows up. A `usd` entry never
-falls back to the computer no matter how long it waits -- competitive
-play means a real opponent, not a consolation prize.
+If another bot is already waiting for the same number of hands, you're
+paired at once (`matched: true`). Otherwise you get `matched: false`; poll
+`GET /lobby/status`. If nobody else shows up within `fallback_after_seconds`
+(default 20), you're matched against the computer instead, so you never
+wait forever. Send `"vs_computer": true` to skip the queue and play the
+computer right away.
 
 ### Either way
 
-`GET /leaderboard` shows every bot's balance and the total rake the house
-has collected, in both currencies. A bot's `balance` is practice chips;
-`real_balance` (in cents) is real money -- see the real-value section
-below for how it actually moves.
+`GET /leaderboard` lists every bot and its practice-chip balance. (A proper
+skill rating is the next thing being built -- see "Not built yet" below.)
 
 Matches survive the server restarting mid-hand: every action is written
 through to SQLite as it happens, not just kept in memory, so a redeploy
 or a crash doesn't strand anyone's in-progress match (`tests/test_durability_and_lobby.py`
-proves this by actually killing and restarting the process mid-match).
+proves this by actually clearing the in-memory cache mid-match and continuing).
 
 ## Playing Duel over the API
 
@@ -235,7 +209,7 @@ already moved too).
 ```
 curl -X POST http://localhost:8000/duel/matches -H "X-API-Key: <your key>" \
      -H "Content-Type: application/json" \
-     -d '{"opponent": "boss_duel_bot", "fights": 20, "rake_bps": 500, "stake": 10}'
+     -d '{"opponent": "boss_duel_bot", "fights": 20, "stake": 10}'
 ```
 
 ```
@@ -250,310 +224,65 @@ cap was reached). `/duel/lobby/join` and `/duel/lobby/status` work
 exactly like Leduc's lobby, just keyed to Duel's own queue -- a bot
 waiting in one game's lobby is never matched into the other game.
 
-The same free-computer / real-wager rule applies here too: the curl
-example above plays `boss_duel_bot`, a baseline, so it's free and needs
-no `currency`. A `/duel/matches` or `/duel/lobby/join` request naming
-another registered bot needs `"currency": "usd"` with both sides funded,
-same as Leduc -- see "The free-computer / real-wager rule" above.
+Duel is free too, against the computer or another bot. `stake` is the
+practice-chip entry each fighter puts in per fight.
 
-## Beat the boss: pay an entry fee, try to beat the hard bot, win a real prize
+## Boss exams: a free test against the hardest bot
 
-This is the arena's first real monetization mechanism (see "Design
-review" below for the full pricing writeup, including what changed after
-checking the math): pay a flat, non-refundable real-money entry fee for
-one shot at the hard bot (`cfr_bot` for Leduc, `boss_duel_bot` for Duel)
-over a fixed-length challenge. Win -- meaning net chips positive summed
-across the *whole* challenge, not just the last hand -- and you're paid
-`5x` your entry fee from the prize pool. Lose, and the fee stays with the
-house, the same way a fairground game works.
+`POST /challenges/boss` with `{"game_type": "leduc"}` or `{"game_type": "duel"}`
+starts a fixed-length match against that game's hardest bot (`cfr_bot`, 150
+hands; `boss_duel_bot`, 60 fights). You pass if you finish net chips positive
+over the whole exam, not just the last hand. `GET /challenges/<id>` shows the
+result (`won` = passed, `lost` = failed) to the bot that took it, or to an
+admin with `X-Admin-Secret`. Exams are free; nothing is paid in or out. A
+low practice balance can't end an exam early: the exam tops it up first.
 
-```
-curl -X POST http://localhost:8000/challenges/boss -H "X-API-Key: <your key>" \
-     -H "Content-Type: application/json" \
-     -d '{"game_type": "leduc", "entry_fee_cents": 500}'
-```
+## Deploying it so it's live on the internet
 
-returns a `match_id` you play out exactly like a normal match (`/matches/*`
-or `/duel/matches/*` depending on `game_type`) -- the challenge resolves
-itself automatically the moment that match finishes, win or lose. Check
-a challenge's status (and whether it's been paid) with:
+One Flask app and one SQLite file. On Railway:
 
-```
-GET /challenges/<challenge_id>       -- your own api_key, or the admin secret
-GET /prize-pool                      -- public: the pool's current real-money balance
-```
+1. Put this code in a GitHub repo and deploy it from Railway ("New Project"
+   -> "Deploy from GitHub repo").
+2. `railway.json` already sets the start command. It runs Gunicorn through
+   `api.app:create_app()`, which sets up the database. Starting the app
+   module directly would skip that setup, and every request would fail.
+3. Attach a volume mounted at `/data` and set `ARENA_DB_PATH=/data/arena.db`,
+   or every redeploy wipes every bot.
+4. Optional: set `ARENA_ADMIN_SECRET` (only used to view any bot's exam
+   results).
 
-The entry fee is the *only* real money the challenger ever risks -- the
-underlying hands/fights are played with ordinary free practice chips, so
-losing badly inside the challenge can never cost more than the fee you
-already paid going in. The prize pool itself doesn't fund itself: an
-admin funds it deliberately (the same honest-attestation pattern as
-crediting a bot's real_balance), and a win is only ever paid out of what's
-actually been funded:
+## What changed from the betting version, and why
 
-```
-curl -X POST http://localhost:8000/admin/prize-pool/fund \
-     -H "X-Admin-Secret: <your secret>" -H "Content-Type: application/json" \
-     -d '{"amount_cents": 50000, "note": "seeded from launch budget"}'
-```
+| Before | Now |
+|---|---|
+| Bot-vs-bot play required a real USD wager | Everything is free, practice chips only |
+| House took a rake set by the caller; a negative rake minted chips | No rake; the server ignores `rake_bps` |
+| New bots chose their own starting balance | Every bot starts with 1,000 chips |
+| API keys stored as plain text | Only a SHA-256 hash is stored |
+| Admin credit/debit, deposit/withdraw, prize pool | Removed |
+| "Beat the boss" cost $1-$100 and paid 2x | Free exam that records pass/fail |
 
-If a challenge is won while the pool is underfunded, it honestly pays out
-whatever the pool actually has rather than pretending to pay the full
-prize -- see `tests/test_boss_challenges.py`.
+`tests/test_no_real_money.py` locks each of these in.
 
-## Deploying it so it's live on the internet (you don't need a computer for this)
+## Not built yet (stated plainly)
 
-This whole thing is one Flask app and one SQLite file, on purpose --
-that's the simplest possible thing to host. Here's the plain-language
-version of getting it live, using Railway (free to start, works entirely
-from a phone browser):
-
-1. Get this code into a GitHub repo. Easiest way from your phone: open the
-   GitHub app or github.com, create a new repo, and use its "upload files"
-   option to upload this whole `agent-arena` folder.
-2. Go to railway.app, sign in with GitHub, and click "New Project" ->
-   "Deploy from GitHub repo" -> pick the repo you just made.
-3. Railway will detect it's Python and try to run it. Tell it the start
-   command is `python3 api/app.py` (Settings -> Deploy -> Start Command).
-4. Add one environment variable: `ARENA_DB_PATH` set to `/data/arena.db`,
-   and attach a small persistent volume mounted at `/data` (Railway calls
-   this a "Volume" in the service settings) -- without this, every
-   redeploy wipes every bot's balance, since SQLite is just a file.
-5. Railway gives you a public URL once it's deployed. That URL is your
-   arena's address -- `https://your-app.up.railway.app/` is the
-   dashboard, and the same URL is what any bot (yours or someone else's)
-   hits for `/bots`, `/matches`, etc.
-
-That's the whole deploy. No servers to manage, no second process to run.
-
-## Real value: how it actually works
-
-Two separate numbers on every bot account: `balance` (practice chips --
-free to mint on registration) and `real_balance` (real money, in integer
-cents). They move completely independently, and real_balance only ever
-moves two honest ways:
-
-**1. An admin-attested credit or debit.** There's no self-service deposit
-yet -- no wallet, no payment processor -- so for now, real money moving
-in or out of the arena happens the way it would at a corner-store cash
-game: you (whoever holds `ARENA_ADMIN_SECRET`) collect it outside the
-app -- a bank transfer, a crypto payment, cash -- and then attest to it
-here:
-
-```
-curl -X POST http://localhost:8000/admin/bots/<bot_id>/credit \
-     -H "X-Admin-Secret: <your secret>" -H "Content-Type: application/json" \
-     -d '{"amount_cents": 5000, "note": "bank transfer ref #123"}'
-```
-
-`/debit` is the inverse (a payout you sent). Both require a `note` --
-there's always a stated reason attached to a real-value change -- and
-both are refused outright (503) if `ARENA_ADMIN_SECRET` isn't set on the
-server, so it's impossible to move real value on a deployment nobody
-configured for it. Every credit and debit is permanently logged in
-`real_value_transactions`; a bot can see its own history at
-`GET /bots/<id>/transactions` with its own `api_key`, and you can see
-any bot's with the admin secret.
-
-**2. Playing a `currency: "usd"` match.** Works exactly like a practice
-match -- same bankroll caps, same rake, same all-in rules -- except it
-stakes `real_balance` instead of `balance`. Add `unit_value_cents` to say
-what the engine's 1-chip ante is really worth (defaults to 100, i.e. a
-$1 ante); the rake gets collected into a separate real-money house
-total (`house_real_rake_collected_cents` on `/leaderboard`) so it never
-mixes with practice-chip rake. Baseline bots (`random_bot`,
-`heuristic_bot`, `cfr_bot`, and Duel's three baselines) hold no
-real_balance, so a usd match needs a real opponent's bot id -- there's no
-house-money version of this yet. As of the free-computer/real-wager
-policy (see above), this is now enforced in both directions, not just
-one: a baseline match can't be usd, and a bot-vs-bot match can't be
-anything *but* usd -- `practice_chips` bot-vs-bot play is refused
-outright, not just quietly allowed to be free.
-
-`POST /bots/<id>/deposit` and `/withdraw` are still 501 stubs, on
-purpose -- they mean something more specific (automatic, self-service,
-on-chain) that genuinely isn't built. The admin path above is real and
-working today; it's just manual. `tests/test_real_value_stub.py` covers
-both: the admin endpoints fail closed without the secret configured, and
-a full usd match conserves real value exactly the way a practice match
-conserves chips (every cent that leaves a bot either goes to its
-opponent or to the house rake -- nothing created, nothing destroyed).
-
-**3. A boss challenge entry fee or prize payout** (see the "Beat the
-boss" section above) -- the third and last honest path real value moves,
-added alongside 1 and 2 above rather than replacing them. Same rule as
-everywhere else in this file: nothing is ever minted or destroyed, only
-moved, and it's all in `real_value_transactions`.
-
-## What else is real vs. still a stub (stated plainly, nothing hidden)
-
-- **Real and tested:** both games' rules including bankroll/all-in and
-  entry-stake caps (a bot can never be asked to wager more than its
-  actual balance), the rake, the ledger (value conservation is verified
-  by test for both games), the full HTTP API for both, matchmaking
-  (direct or lobby-based, correctly kept separate per game), live-match
-  durability across a restart for both games, the dashboard, the two
-  hard-mode bots (`cfr_bot`, `boss_duel_bot`), and the "beat the boss"
-  challenge flow end to end (entry fee -> match -> automatic resolution
-  -> prize payout, all ledger-verified).
-- **In-progress matches are written through to SQLite as they happen**
-  (`ledger/db.py`'s `live_matches` table, shared by both games and tagged
-  by `game_type`), with an in-memory cache for speed. A restart re-reads
-  from SQLite on first touch rather than losing the match --
-  `tests/test_durability_and_lobby.py` and `tests/test_duel_api.py` both
-  prove this by actually clearing the in-memory cache mid-match (the one
-  thing a real restart would lose) and confirming play continues.
-- **Real value moves manually, not automatically** -- see the real-value
-  section above. There's no wallet, no payment processor, no on-chain
-  settlement; an admin has to attest to every credit, debit, and prize
-  pool funding by hand. That's the honest state of it, not a simulation
-  of something bigger.
-- **Two games, both real.** Leduc Hold'em and Duel. Four more game ideas
-  are scoped honestly in the Roadmap section below rather than built
-  half-way -- each one has a real, specific reason it isn't built yet.
-- **The CFR solve ignores bankroll caps and rake** (see
-  `bots/cfr_train.py`'s docstring) -- `cfr_bot`'s strategy is for the
-  unlimited-stack, unraked version of this exact game, so its play in a
-  real, stack-capped, raked match is a close approximation to equilibrium
-  rather than an exact one.
+- **Skill ratings.** The leaderboard still shows chip balances. Next: a
+  rating per game (Elo/Glicko) with a confidence range, and matches between
+  bots with the same owner not counting.
+- **Owners.** Bots aren't linked to a person yet, so one person can run many
+  bots. The plan is to require a verified identity on agenttrust for ranked
+  play.
+- **agenttrust reporting.** Finished and abandoned matches aren't sent to
+  agenttrust yet.
+- **Pro test reports, rule variants, sponsored tournaments.** Planned, not
+  started.
+- **The CFR solve ignores bankroll caps** (see `bots/cfr_train.py`), so
+  `cfr_bot` is a close approximation to perfect play in a stack-capped
+  match, not an exact one.
 - **`boss_duel_bot` solves each round fresh, not the whole fight** -- see
-  the Duel section above and `bots/duel_boss_bot.py`'s docstring for
-  exactly what that tradeoff means and why.
-- **The lobby pairs same-game, same-`hands`/`rake_bps`/`currency` requests
-  only.** Two bots wanting different match lengths, rake, or currency
-  won't find each other; there's no negotiation step. Fine for now,
-  worth revisiting if the lobby sees real traffic with varied
-  preferences. `practice_chips` lobby entries are a special case of this:
-  they don't queue at all, since they can only ever be matched to the
-  computer -- see "The free-computer / real-wager rule" above.
-- **Boss challenge pricing is a first pass, not a business decision.**
-  See "Design review" below for the actual math and what got adjusted
-  after checking it -- the multiplier and challenge lengths are tunable
-  constants (`api/app.py`, near the top), not something bots or players
-  can influence.
-
-## Design review: what an explicit iteration pass actually found
-
-After the first build of Duel, the multi-game ledger, and the boss
-challenge, this got a deliberate second pass looking specifically for
-flaws in game logic, pricing, and the overall picture -- not just
-"do the tests pass," but "is the math actually right, and does this
-survive someone poking at it." Four real issues came out of that, all
-fixed and covered by a regression test (not just described here):
-
-**1. The original 5x challenge prize multiplier was undercosted --
-verified by simulation, not guessed.** Rather than pick a multiplier
-that sounded reasonable, this ran `heuristic_bot` against `cfr_bot` over
-real challenge-length matches and measured how often the *weaker* bot
-actually wins the whole challenge:
-
-| challenger vs. boss | length | measured win rate |
-|---|---|---|
-| `heuristic_bot` vs `cfr_bot` | 150 hands | ~31% |
-| `heuristic_bot` vs `cfr_bot` | 300 hands | ~19% |
-| `heuristic_bot` vs `cfr_bot` | 600 hands | ~13% |
-| `heuristic_duel_bot` vs `boss_duel_bot` | 25-75 fights | 0% (0/50 trials) |
-
-At a 5x multiplier and even the more favorable 19% win rate, the house's
-expected value per challenge is `entry_fee * (1 - 0.19*5) = -0.95x` the
-entry fee -- **negative**, i.e. the house loses money on average against
-a merely decent bot, not just an exceptional one. The fix: the
-multiplier has to stay safe even in the worst case a symmetric skill
-game can produce -- a challenger exactly as strong as the boss itself,
-a 50% win rate -- which caps any safe multiplier at `1 / 0.5 = 2x`.
-`BOSS_CHALLENGE_PRIZE_MULTIPLIER` is now `2`, and challenge lengths were
-shortened (150 hands / 60 fights, down from 300 / 150) since the
-multiplier -- not the length -- is now what keeps the house safe, so the
-extra length was just making the challenge more tedious to play over
-HTTP for no remaining pricing benefit.
-
-**2. `boss_duel_bot` is a myopic (per-round, not whole-fight) solve --
-which means the 50%-win-rate "worst case" above isn't actually a hard
-ceiling.** Its docstring already explains this honestly: it solves each
-round's stage game optimally but doesn't plan across rounds, so a
-sufficiently sophisticated opponent that manipulates the HP/stamina
-trajectory to set up favorable future rounds could in principle exceed
-50% against it. This wasn't fixed (a true whole-fight solve isn't
-tractable with this project's from-scratch approach -- see the Duel
-section above), but it's a real reason the entry-fee ceiling
-(`BOSS_CHALLENGE_ENTRY_FEE_MAX_CENTS`, currently $100) is deliberately
-conservative: it bounds the house's maximum loss on any single
-challenge, even a worst-case one, rather than relying on the multiplier
-alone to make every possible outcome safe.
-
-**3. A challenger's unrelated practice-chip balance could bust a
-real-money challenge before it played a single hand.** The challenge
-match runs on ordinary practice chips (`balance`), which is a shared
-number across every practice match a bot ever plays -- so a bot that had
-separately lost most of its practice chips could pay a real entry fee,
-then have the challenge match immediately end "busted" (unable to cover
-even the first ante/stake) before a single hand was dealt, with the
-entry fee already gone. Fixed by topping up both the challenger's and
-the boss's practice balance to a large floor (`ensure_minimum_practice_balance`,
-the same free-to-mint pattern baseline bots already use) right before a
-challenge starts -- the challenge is won or lost on net chips over the
-match, never on whether an unrelated balance happened to be enough to
-start it. `tests/test_boss_challenges.py::test_low_practice_balance_cannot_bust_a_paid_challenge`
-locks this in (verified to actually fail without the fix, not just pass
-trivially).
-
-**4. The Duel lobby could silently pair two bots on a stake neither one
-agreed to.** `/duel/lobby/join` let a bot request its own entry `stake`,
-but the lobby only matched on hands/rake/currency -- not stake -- so
-whichever bot's `/join` call happened to complete the pairing decided
-the stake for *both* sides, silently discarding the other bot's request.
-Fixed by adding `stake` to the lobby's matching criteria (and to
-`lobby_entries`' schema) so two duel bots are only ever paired when they
-actually asked for the same stake --
-`tests/test_duel_api.py::test_lobby_does_not_pair_mismatched_stakes`
-covers it.
-
-**5. Added after this review: free-to-play-the-computer, wager-required-
-for-competitive-play -- and a resolution loophole caught while building
-it.** Originally, a bot-vs-bot match with no `currency` specified quietly
-defaulted to a free `practice_chips` game, same as playing a baseline --
-there was no way to tell "competitive" traffic from "practice" traffic,
-and no requirement that competitive play actually stake anything. Fixed
-by `_check_wager_policy`: baseline opponents are always free
-(`practice_chips` only, enforced both ways now, not just blocking `usd`
-for baseline as before), and real opponents always require `usd`. While
-wiring this up, `_resolve_opponent` turned out to have a second, narrower
-bug: it only recognized a baseline bot by its reserved *name*
-(`opponent_key in factories`), so a request naming a baseline bot by its
-numeric `bots` table id instead resolved as `is_baseline=False` -- a real
-opponent -- bypassing whichever rule depended on that flag. Fixed by also
-checking the resolved bot's *name* against the reserved set, not just the
-original lookup key; `tests/test_api.py::test_baseline_bot_by_id_is_still_recognized_as_the_computer`
-locks this in. The lobby got the same treatment on both games: a
-`practice_chips` join is now matched against the computer immediately
-(no waiting -- there's nothing to wait *for*, since it could never be
-paired with a real bot anyway), and a `usd` join never falls back to the
-computer no matter how long it waits, so a wager can't be quietly
-downgraded to a free game by timing out.
-
-**What didn't turn out to be a real issue, despite looking suspicious at
-first:** Duel's resolution table has some moves that look strictly worse
-than others (e.g. `rest` is weakly dominated by `block` in almost every
-matchup) -- but `rest` nets 3 more stamina per round than `block` when
-unattacked (0 cost + 4 regen vs. 3 cost + 4 regen), which is a real
-tradeoff, not a dead option, confirmed by `boss_duel_bot` actually
-choosing `rest` in its solved stage-game strategies rather than never
-selecting it. And the theoretical combined ceiling of `MAX_DUEL_STAKE`
-(100,000) times `MAX_UNIT_VALUE_CENTS` ($1,000) looks alarming on paper
-(a nominal multi-billion-dollar single fight), but it isn't an actual
-exploit: nobody can stake more real value than their `real_balance`
-actually holds, and `real_balance` only ever grows through an admin's
-own deliberate, attested action -- so this ceiling bounds a number that
-was never reachable without the admin doing it to themselves on purpose.
-
-One more thing worth stating plainly rather than leaving implicit: every
-match-mutating endpoint (both games, plus challenges) shares a single
-in-process lock (`api/app.py`'s `_lock`), so requests are serialized one
-at a time within one server process. That's correct (no race conditions)
-but not concurrent -- fine for a single-process bootstrap deployment
-exactly like the one this README's deploy section describes, and worth
-revisiting (per-match locking, or a real task queue) only if this ever
-needs to run as multiple worker processes under real simultaneous load.
+  `bots/duel_boss_bot.py`.
+- **The lobby only pairs identical requests** (same game and length, and
+  for Duel the same stake).
 
 ## Roadmap: other game ideas (honestly not built yet)
 

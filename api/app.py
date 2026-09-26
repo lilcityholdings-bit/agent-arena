@@ -65,57 +65,30 @@ LOBBY_DUEL_FALLBACK_BOT = "heuristic_duel_bot"
 LOBBY_DEFAULT_FALLBACK_SECONDS = 20
 
 DEFAULT_STARTING_BALANCE = 1000
-DEFAULT_RAKE_BPS = 500
+# No rake. Agent Arena is a proving ground, not a casino: nothing is wagered,
+# so there is nothing to take a cut of. The server fixes this at zero and
+# never reads it from a request -- it used to, and a negative value let any
+# caller mint chips out of nothing.
+RAKE_BPS = 0
 MAX_HANDS_PER_MATCH = 10000
 MAX_FIGHTS_PER_MATCH = 10000
 DEFAULT_DUEL_STAKE = 10
 MAX_DUEL_STAKE = 100_000
-# practice_chips: the free-to-mint number every bot starts with (`balance`).
-# usd: real_balance, in cents -- only reachable via an admin-attested
-# credit (see /admin/bots/<id>/credit) since there's no self-service
-# deposit path yet. Anything else is refused outright.
-SUPPORTED_CURRENCIES = ("practice_chips", "usd")
+# practice_chips: the only currency. Every bot starts with the same fixed
+# amount; chips have no cash value and can't be bought, sold or cashed out.
+# Real money was removed on purpose -- wagering real money on poker between
+# bots is unlicensed gambling in most places.
+SUPPORTED_CURRENCIES = ("practice_chips",)
 SUPPORTED_CURRENCY = "practice_chips"  # kept as the explicit default
 DEFAULT_UNIT_VALUE_CENTS = 100  # $1.00 per game-engine chip unit, for usd matches
 MAX_UNIT_VALUE_CENTS = 100_000  # $1,000 per unit -- a sanity ceiling, not a business decision
 
-# --------------------------------------------------------------------------
-# Phase 1 monetization: "beat the boss" challenges.
-#
-# A bot pays a flat, non-refundable real-money entry fee for one shot at
-# a boss bot over a fixed number of hands/fights, played with ordinary
-# practice chips (no extra real money at risk beyond the entry fee -- see
-# the docstring on the /challenges/boss route for why). Win (net chips
-# positive over the whole challenge, not just "won the last hand") and
-# the challenge pays PRIZE_MULTIPLIER times the entry fee from the prize
-# pool; lose and the entry fee stays with the house. This is deliberately
-# the simplest monetization mechanism that needs no payment processor and
-# no liquidity beyond what an admin funds into the prize pool up front --
-# see credit_real_balance/fund_prize_pool for how real money gets in.
-#
-# These specific numbers (fee bounds, multiplier, challenge length) are a
-# first pass -- see the "Design review" section of README.md for the
-# actual math behind them and what was adjusted after checking it.
-# --------------------------------------------------------------------------
+# Boss exams (free): which bot each game's exam is against, and how long it runs.
 BOSS_CHALLENGE_BOSS_NAME = {"leduc": "cfr_bot", "duel": "boss_duel_bot"}
 BOSS_CHALLENGE_LENGTH = {"leduc": 150, "duel": 60}
-BOSS_CHALLENGE_ENTRY_FEE_DEFAULT_CENTS = 500     # $5.00
-BOSS_CHALLENGE_ENTRY_FEE_MIN_CENTS = 100         # $1.00
-BOSS_CHALLENGE_ENTRY_FEE_MAX_CENTS = 10_000      # $100.00
-# Measured, not guessed: simulating heuristic_bot vs cfr_bot over 150
-# hands wins ~31% of the time, and heuristic_duel_bot could not beat
-# boss_duel_bot even once in 50 tries at 25-75 fights. A multiplier is
-# only safe if it can't go net-negative for the house even against a
-# challenger as strong as the boss itself (the worst case a symmetric
-# game can produce, ~50% win rate) -- 1 - 0.5*multiplier >= 0 requires
-# multiplier <= 2. See README.md's "Design review" section for the full
-# investigation, including why this was 5 in an earlier, unchecked draft.
-BOSS_CHALLENGE_PRIZE_MULTIPLIER = 2              # win 2x your entry fee -- safe even in the worst case
-BOSS_CHALLENGE_RAKE_BPS = 0  # the entry fee is the monetization; no extra rake stacked on top
-# Free practice chips topped up before a challenge starts, so a low (or
-# zero) practice balance -- completely unrelated to the real entry fee
-# just paid -- can never bust the challenge match before it's played a
-# single hand/fight. Same order of magnitude as BASELINE_STARTING_BALANCE.
+BOSS_CHALLENGE_RAKE_BPS = RAKE_BPS
+# Free practice chips topped up before an exam starts, so a low practice
+# balance can never bust the exam before it's played a single hand/fight.
 BOSS_CHALLENGE_MIN_PRACTICE_BALANCE = 1_000_000
 
 
@@ -181,13 +154,7 @@ def dashboard():
     with db.connect() as conn:
         bots = [dict(r) for r in db.list_bots(conn)]
         matches = [dict(r) for r in db.recent_matches(conn, limit=25)]
-        house_rake = db.house_balance(conn)
-        real_house_rake_cents = db.real_house_balance(conn)
-        prize_pool_cents = db.prize_pool_balance(conn)
-    return render_template(
-        "index.html", bots=bots, matches=matches, house_rake=house_rake,
-        real_house_rake_cents=real_house_rake_cents, prize_pool_cents=prize_pool_cents,
-    )
+    return render_template("index.html", bots=bots, matches=matches)
 
 
 @app.route("/bots", methods=["POST"])
@@ -198,10 +165,11 @@ def register_bot():
         return jsonify(error="name is required"), 400
     if name in _all_reserved_names():
         return jsonify(error=f"{name!r} is a reserved baseline-bot name"), 400
-    starting_balance = int(body.get("starting_balance", DEFAULT_STARTING_BALANCE))
+    # The server sets the starting balance. It used to take it from the
+    # request, so any bot could register with a billion chips.
     with db.connect() as conn:
         try:
-            bot = db.create_bot(conn, name, starting_balance)
+            bot = db.create_bot(conn, name, DEFAULT_STARTING_BALANCE)
         except Exception as exc:  # unique constraint, etc.
             return jsonify(error=f"could not register bot: {exc}"), 400
     return jsonify(bot), 201
@@ -211,147 +179,17 @@ def register_bot():
 def leaderboard():
     with db.connect() as conn:
         rows = db.list_bots(conn)
-        house = db.house_balance(conn)
-        real_house = db.real_house_balance(conn)
     return jsonify(
-        house_rake_collected=house,
-        house_real_rake_collected_cents=real_house,
-        bots=[{"id": r["id"], "name": r["name"], "balance": r["balance"], "real_balance": r["real_balance"]} for r in rows],
+        bots=[{"id": r["id"], "name": r["name"], "balance": r["balance"]} for r in rows],
     )
 
 
 # --------------------------------------------------------------------------
-# Real value.
-#
-# `balance` (practice chips) is what practice_chips matches play with.
-# `real_balance` (in cents) is real, and moves exactly two ways:
-#   1. An admin-attested credit/debit below -- Robert (or whoever holds
-#      ARENA_ADMIN_SECRET) records that value actually moved outside the
-#      app (a bank transfer, a crypto payment) and attests to it here.
-#      This is real bookkeeping, not a simulation: the money already
-#      moved somewhere else; this just records it. Refuses outright
-#      (503) if ARENA_ADMIN_SECRET isn't set, so it's impossible to
-#      credit/debit real value by accident on a deployment nobody
-#      configured for it.
-#   2. Playing a currency="usd" match -- see /matches and /lobby/join.
-#      Bankroll caps and payouts work exactly like practice_chips
-#      matches, just denominated in real_balance instead.
-# /deposit and /withdraw below remain 501 stubs deliberately -- they mean
-# something different (automatic, self-service, on-chain), which still
-# isn't built.
+# Admin access. Only used to look at any bot's exam results; there are no
+# money-moving admin actions any more. Disabled unless ARENA_ADMIN_SECRET is set.
 # --------------------------------------------------------------------------
 
 ADMIN_SECRET_ENV_VAR = "ARENA_ADMIN_SECRET"
-
-
-def _require_admin():
-    configured = os.environ.get(ADMIN_SECRET_ENV_VAR)
-    if not configured:
-        return (
-            jsonify(error=f"admin actions are disabled until {ADMIN_SECRET_ENV_VAR} is set on the server"),
-            503,
-        )
-    provided = request.headers.get("X-Admin-Secret")
-    if not provided or provided != configured:
-        return jsonify(error="invalid or missing X-Admin-Secret"), 401
-    return None
-
-
-@app.route("/admin/bots/<int:bot_id>/credit", methods=["POST"])
-def admin_credit(bot_id: int):
-    err = _require_admin()
-    if err:
-        return err
-    body = request.get_json(silent=True) or {}
-    try:
-        amount_cents = int(body["amount_cents"])
-    except (KeyError, TypeError, ValueError):
-        return jsonify(error="amount_cents (integer, positive) is required"), 400
-    admin_note = str(body.get("note", "")).strip()
-    if not admin_note:
-        return jsonify(error="note is required -- record what this credit corresponds to (e.g. 'bank transfer ref #123')"), 400
-    with db.connect() as conn:
-        if db.get_bot(conn, bot_id) is None:
-            return jsonify(error="no such bot"), 404
-        try:
-            updated = db.credit_real_balance(conn, bot_id, amount_cents, admin_note)
-        except ValueError as exc:
-            return jsonify(error=str(exc)), 400
-    return jsonify(bot_id=bot_id, real_balance=updated["real_balance"], credited_cents=amount_cents), 200
-
-
-@app.route("/admin/bots/<int:bot_id>/debit", methods=["POST"])
-def admin_debit(bot_id: int):
-    err = _require_admin()
-    if err:
-        return err
-    body = request.get_json(silent=True) or {}
-    try:
-        amount_cents = int(body["amount_cents"])
-    except (KeyError, TypeError, ValueError):
-        return jsonify(error="amount_cents (integer, positive) is required"), 400
-    admin_note = str(body.get("note", "")).strip()
-    if not admin_note:
-        return jsonify(error="note is required -- record what this debit corresponds to (e.g. 'payout sent, ref #123')"), 400
-    with db.connect() as conn:
-        if db.get_bot(conn, bot_id) is None:
-            return jsonify(error="no such bot"), 404
-        try:
-            updated = db.debit_real_balance(conn, bot_id, amount_cents, admin_note)
-        except ValueError as exc:
-            return jsonify(error=str(exc)), 400
-    return jsonify(bot_id=bot_id, real_balance=updated["real_balance"], debited_cents=amount_cents), 200
-
-
-@app.route("/bots/<int:bot_id>/transactions", methods=["GET"])
-def bot_transactions(bot_id: int):
-    """A bot can audit its own real-value history with its own api_key;
-    an admin can audit any bot's with X-Admin-Secret."""
-    provided_admin_secret = request.headers.get("X-Admin-Secret")
-    configured_admin_secret = os.environ.get(ADMIN_SECRET_ENV_VAR)
-    is_admin = bool(configured_admin_secret) and provided_admin_secret == configured_admin_secret
-    if not is_admin:
-        bot, err = _require_bot()
-        if err:
-            return err
-        if bot["id"] != bot_id:
-            return jsonify(error="you can only view your own transaction history (or authenticate as admin)"), 403
-    with db.connect() as conn:
-        rows = db.real_value_transactions(conn, bot_id)
-    return jsonify(bot_id=bot_id, transactions=[dict(r) for r in rows])
-
-@app.route("/bots/<int:bot_id>/deposit", methods=["POST"])
-def deposit(bot_id: int):
-    bot, err = _require_bot()
-    if err:
-        return err
-    if bot["id"] != bot_id:
-        return jsonify(error="you can only deposit into your own account"), 403
-    return jsonify(
-        error="deposits are not implemented yet",
-        detail=(
-            "real_balance has no path in from any chain right now. This endpoint is a stable "
-            "placeholder for when stablecoin settlement is wired in -- calling it moves no money "
-            "and changes no balance."
-        ),
-    ), 501
-
-
-@app.route("/bots/<int:bot_id>/withdraw", methods=["POST"])
-def withdraw(bot_id: int):
-    bot, err = _require_bot()
-    if err:
-        return err
-    if bot["id"] != bot_id:
-        return jsonify(error="you can only withdraw from your own account"), 403
-    return jsonify(
-        error="withdrawals are not implemented yet",
-        detail=(
-            "real_balance has no path out to any chain right now. This endpoint is a stable "
-            "placeholder for when stablecoin settlement is wired in -- calling it moves no money "
-            "and changes no balance."
-        ),
-    ), 501
 
 
 # --------------------------------------------------------------------------
@@ -381,17 +219,11 @@ def _resolve_opponent(conn, opponent_key: str, factories: dict = None) -> tuple[
 
 
 def _check_wager_policy(is_baseline: bool, currency: str) -> str | None:
-    """The traffic-generation rule: playing the computer (a baseline bot)
-    is always free, and competitive play (another real bot) always
-    requires an actual wager. practice_chips can't be a real wager -- it's
-    the free currency every bot is minted with -- so "requires a wager"
-    concretely means "requires currency=usd", the one currency backed by
-    real_balance an admin actually funded. Returns an error string to 400
-    with, or None if `currency` is allowed for this kind of opponent."""
-    if is_baseline and currency != "practice_chips":
-        return "the computer is free to play -- baseline bots only play practice_chips matches, never real money"
-    if not is_baseline and currency != "usd":
-        return "competitive play (bot vs bot) requires a real wager -- pass currency=\"usd\" (baseline bots are the free, practice_chips option)"
+    """Every match, against the computer or another bot, is played for
+    practice chips. Bot-vs-bot used to *require* real money; now nothing
+    does. Returns an error string to 400 with, or None if allowed."""
+    if currency != "practice_chips":
+        return "every match is played for practice chips -- there is no real-money play"
     return None
 
 
@@ -469,9 +301,8 @@ def _maybe_resolve_boss_challenge(conn, match_id: int, challenger_bot_id: int) -
     """If this match_id belongs to a pending boss challenge, decides won
     vs. lost by the challenge's actual win condition -- net payoff to the
     challenger summed across every hand/fight actually played in this
-    match, not just whether the last one went their way -- and pays out
-    (or doesn't) accordingly. Returns the resolved challenge row, or None
-    if this match had no challenge attached."""
+    match, not just whether the last one went their way. Returns the
+    resolved challenge row, or None if this match had no challenge."""
     challenge = db.get_boss_challenge_by_match(conn, match_id)
     if challenge is None or challenge["status"] != "pending":
         return None
@@ -618,7 +449,7 @@ def create_match():
     body = request.get_json(silent=True) or {}
     opponent_key = str(body.get("opponent", "")).strip()
     hands = int(body.get("hands", 1))
-    rake_bps = int(body.get("rake_bps", DEFAULT_RAKE_BPS))
+    rake_bps = RAKE_BPS
     if not opponent_key:
         return jsonify(error="opponent is required (a baseline bot name, or another bot's id)"), 400
     if not (1 <= hands <= MAX_HANDS_PER_MATCH):
@@ -729,20 +560,18 @@ def match_summary(match_id: int):
 
 @app.route("/lobby/join", methods=["POST"])
 def lobby_join():
-    """practice_chips is the free-to-play-the-computer currency -- and
-    since a baseline bot never holds real_balance, a practice_chips entry
-    can never be a competitive (bot vs bot) wager anyway, so there's no
-    reason to make it wait: it's matched against a baseline bot instantly,
-    which is exactly what "free, to generate traffic" wants. usd entries
-    are the real thing -- they queue for a genuine opponent and never fall
-    back to the computer, because competitive play requires a real wager,
-    and a baseline bot can't supply one."""
+    """Queues for another bot. If one is already waiting for the same game
+    length, the two are matched at once. Otherwise poll /lobby/status: after
+    `fallback_after_seconds` (default 20) with nobody else around, the bot is
+    matched against the computer so it never waits forever. Pass
+    `"vs_computer": true` to skip the queue and play the computer now."""
     bot, err = _require_bot()
     if err:
         return err
     body = request.get_json(silent=True) or {}
     hands = int(body.get("hands", 20))
-    rake_bps = int(body.get("rake_bps", DEFAULT_RAKE_BPS))
+    rake_bps = RAKE_BPS
+    vs_computer = bool(body.get("vs_computer"))
     fallback_after_seconds = float(body.get("fallback_after_seconds", LOBBY_DEFAULT_FALLBACK_SECONDS))
     if not (1 <= hands <= MAX_HANDS_PER_MATCH):
         return jsonify(error=f"hands must be between 1 and {MAX_HANDS_PER_MATCH}"), 400
@@ -756,7 +585,7 @@ def lobby_join():
             if existing_match_id:
                 return jsonify(matched=True, match_id=existing_match_id)
 
-            if currency == "practice_chips":
+            if vs_computer:
                 opponent_bot_id, opponent_name, _ = _resolve_opponent(conn, LOBBY_FALLBACK_BOT)
                 match_id = db.create_match(conn, bot["id"], opponent_bot_id, hands, rake_bps, currency, unit_value_cents)
             else:
@@ -769,13 +598,13 @@ def lobby_join():
                 opponent_bot_row = db.get_bot(conn, opponent_row["bot_id"])
                 match_id = db.create_match(conn, bot["id"], opponent_row["bot_id"], hands, rake_bps, currency, unit_value_cents)
 
-        if currency == "practice_chips":
+        if vs_computer:
             live = _new_live_match(match_id, bot["id"], opponent_bot_id, opponent_name, True, hands, rake_bps, currency, unit_value_cents)
             LIVE_MATCHES[match_id] = live
             _start_next_hand(live)
             if not live["done"]:
                 _persist_live(live)
-            return jsonify(matched=True, match_id=match_id, opponent=opponent_name, note="practice_chips is free-to-play -- matched instantly against the computer; competitive bot-vs-bot play needs currency=\"usd\""), 201
+            return jsonify(matched=True, match_id=match_id, opponent=opponent_name), 201
 
         live = _new_live_match(match_id, bot["id"], opponent_row["bot_id"], opponent_bot_row["name"], False, hands, rake_bps, currency, unit_value_cents)
         LIVE_MATCHES[match_id] = live
@@ -802,12 +631,21 @@ def lobby_status():
             if entry is None or entry["game_type"] != "leduc":
                 return jsonify(matched=False, waiting=False, error="not in the lobby -- call /lobby/join first")
 
-            # Only usd (competitive) entries ever sit in the lobby now --
-            # practice_chips ("play the computer") entries are matched
-            # instantly at /lobby/join and never reach here. So there's no
-            # baseline fallback to offer: a real wager needs a real
-            # opponent, however long that takes.
-            return jsonify(matched=False, waiting=True, waiting_seconds=round(time.time() - entry["joined_at"], 1), note="usd lobby entries wait for a real opponent -- competitive play requires a real wager, so there's no auto-fallback to the computer")
+            if time.time() < entry["fallback_after"]:
+                return jsonify(matched=False, waiting=True, waiting_seconds=round(time.time() - entry["joined_at"], 1))
+
+            # Nobody else came: play the computer rather than wait forever.
+            db.leave_lobby(conn, bot["id"])
+            opponent_bot_id, opponent_name, _ = _resolve_opponent(conn, LOBBY_FALLBACK_BOT)
+            hands = entry["hands_wanted"]
+            match_id = db.create_match(conn, bot["id"], opponent_bot_id, hands, RAKE_BPS, SUPPORTED_CURRENCY, 1)
+
+        live = _new_live_match(match_id, bot["id"], opponent_bot_id, opponent_name, True, hands, RAKE_BPS)
+        LIVE_MATCHES[match_id] = live
+        _start_next_hand(live)
+        if not live["done"]:
+            _persist_live(live)
+    return jsonify(matched=True, match_id=match_id, opponent=opponent_name, note="no other bot was waiting, so you're playing the computer")
 
 
 @app.route("/lobby/leave", methods=["POST"])
@@ -1021,7 +859,7 @@ def create_duel_match():
     body = request.get_json(silent=True) or {}
     opponent_key = str(body.get("opponent", "")).strip()
     fights = int(body.get("fights", 1))
-    rake_bps = int(body.get("rake_bps", DEFAULT_RAKE_BPS))
+    rake_bps = RAKE_BPS
     stake = int(body.get("stake", DEFAULT_DUEL_STAKE))
     if not opponent_key:
         return jsonify(error="opponent is required (a baseline bot name, or another bot's id)"), 400
@@ -1132,17 +970,18 @@ def duel_match_summary(match_id: int):
 
 @app.route("/duel/lobby/join", methods=["POST"])
 def duel_lobby_join():
-    """Same free-computer / wager-required-for-competitive split as
-    /lobby/join (see its docstring): a practice_chips entry is matched
-    against a baseline duel bot immediately, a usd entry queues for a real
-    opponent and never falls back to the computer."""
+    """Same rules as /lobby/join: queue for another bot, fall back to the
+    computer after `fallback_after_seconds`, or `"vs_computer": true` to
+    play the computer now. Bots are only paired with others asking for the
+    same stake."""
     bot, err = _require_bot()
     if err:
         return err
     body = request.get_json(silent=True) or {}
     fights = int(body.get("fights", 20))
-    rake_bps = int(body.get("rake_bps", DEFAULT_RAKE_BPS))
+    rake_bps = RAKE_BPS
     stake = int(body.get("stake", DEFAULT_DUEL_STAKE))
+    vs_computer = bool(body.get("vs_computer"))
     fallback_after_seconds = float(body.get("fallback_after_seconds", LOBBY_DEFAULT_FALLBACK_SECONDS))
     if not (1 <= fights <= MAX_FIGHTS_PER_MATCH):
         return jsonify(error=f"fights must be between 1 and {MAX_FIGHTS_PER_MATCH}"), 400
@@ -1156,7 +995,7 @@ def duel_lobby_join():
             if existing_match_id:
                 return jsonify(matched=True, match_id=existing_match_id)
 
-            if currency == "practice_chips":
+            if vs_computer:
                 opponent_bot_id, opponent_name, _ = _resolve_opponent(conn, LOBBY_DUEL_FALLBACK_BOT, DUEL_BASELINE_BOT_FACTORIES)
                 match_id = db.create_match(conn, bot["id"], opponent_bot_id, fights, rake_bps, currency, unit_value_cents, game_type="duel")
             else:
@@ -1173,13 +1012,13 @@ def duel_lobby_join():
                 opponent_bot_row = db.get_bot(conn, opponent_row["bot_id"])
                 match_id = db.create_match(conn, bot["id"], opponent_row["bot_id"], fights, rake_bps, currency, unit_value_cents, game_type="duel")
 
-        if currency == "practice_chips":
+        if vs_computer:
             live = _new_live_duel_match(match_id, bot["id"], opponent_bot_id, opponent_name, True, fights, rake_bps, stake, currency, unit_value_cents)
             LIVE_DUEL_MATCHES[match_id] = live
             _start_next_fight(live)
             if not live["done"]:
                 _persist_live_duel(live)
-            return jsonify(matched=True, match_id=match_id, opponent=opponent_name, note="practice_chips is free-to-play -- matched instantly against the computer; competitive bot-vs-bot play needs currency=\"usd\""), 201
+            return jsonify(matched=True, match_id=match_id, opponent=opponent_name), 201
 
         # opponent_row["stake"] == stake by construction (matched on it above).
         live = _new_live_duel_match(match_id, bot["id"], opponent_row["bot_id"], opponent_bot_row["name"], False, fights, rake_bps, stake, currency, unit_value_cents)
@@ -1207,10 +1046,21 @@ def duel_lobby_status():
             if entry is None or entry["game_type"] != "duel":
                 return jsonify(matched=False, waiting=False, error="not in the duel lobby -- call /duel/lobby/join first")
 
-            # Only usd (competitive) entries ever sit in the lobby now --
-            # practice_chips ("play the computer") entries are matched
-            # instantly at /duel/lobby/join and never reach here.
-            return jsonify(matched=False, waiting=True, waiting_seconds=round(time.time() - entry["joined_at"], 1), note="usd lobby entries wait for a real opponent -- competitive play requires a real wager, so there's no auto-fallback to the computer")
+            if time.time() < entry["fallback_after"]:
+                return jsonify(matched=False, waiting=True, waiting_seconds=round(time.time() - entry["joined_at"], 1))
+
+            # Nobody else came: fight the computer rather than wait forever.
+            db.leave_lobby(conn, bot["id"])
+            opponent_bot_id, opponent_name, _ = _resolve_opponent(conn, LOBBY_DUEL_FALLBACK_BOT, DUEL_BASELINE_BOT_FACTORIES)
+            fights, stake = entry["hands_wanted"], entry["stake"]
+            match_id = db.create_match(conn, bot["id"], opponent_bot_id, fights, RAKE_BPS, SUPPORTED_CURRENCY, 1, game_type="duel")
+
+        live = _new_live_duel_match(match_id, bot["id"], opponent_bot_id, opponent_name, True, fights, RAKE_BPS, stake)
+        LIVE_DUEL_MATCHES[match_id] = live
+        _start_next_fight(live)
+        if not live["done"]:
+            _persist_live_duel(live)
+    return jsonify(matched=True, match_id=match_id, opponent=opponent_name, note="no other bot was waiting, so you're fighting the computer")
 
 
 @app.route("/duel/lobby/leave", methods=["POST"])
@@ -1224,59 +1074,18 @@ def duel_lobby_leave():
 
 
 # ==========================================================================
-# Phase 1 monetization: "beat the boss" challenges. See the constants
-# block near the top of this file for the actual numbers and why.
+# Boss exams: a fixed-length match against the strongest baseline bot for a
+# game. Free. Passing (net chips positive over the whole exam) is recorded
+# and can be shown as a badge. Nothing is paid in or out.
 # ==========================================================================
-
-@app.route("/admin/prize-pool/fund", methods=["POST"])
-def admin_fund_prize_pool():
-    """An admin moving real value they've actually set aside into the
-    prize pool -- the same honest-attestation pattern as /admin/bots/*
-    /credit: this records money that was genuinely earmarked for prizes,
-    it doesn't create any. Challenge wins can only ever pay out of what's
-    actually been funded here (see resolve_boss_challenge)."""
-    err = _require_admin()
-    if err:
-        return err
-    body = request.get_json(silent=True) or {}
-    try:
-        amount_cents = int(body["amount_cents"])
-    except (KeyError, TypeError, ValueError):
-        return jsonify(error="amount_cents (integer, positive) is required"), 400
-    note = str(body.get("note", "")).strip()
-    if not note:
-        return jsonify(error="note is required -- record what this funding corresponds to"), 400
-    with db.connect() as conn:
-        try:
-            new_balance = db.fund_prize_pool(conn, amount_cents, note)
-        except ValueError as exc:
-            return jsonify(error=str(exc)), 400
-    return jsonify(prize_pool_balance_cents=new_balance, funded_cents=amount_cents), 200
-
-
-@app.route("/prize-pool", methods=["GET"])
-def prize_pool_status():
-    """Public and deliberately so -- a challenger should be able to see
-    the pool can actually cover the prize before paying an entry fee."""
-    with db.connect() as conn:
-        balance = db.prize_pool_balance(conn)
-    return jsonify(balance_cents=balance)
-
 
 @app.route("/challenges/boss", methods=["POST"])
 def create_boss_challenge():
-    """Pay a flat, non-refundable real-money entry fee for one shot at
-    the hard bot for the chosen game (cfr_bot for leduc, boss_duel_bot
-    for duel), over a fixed number of hands/fights. "Winning" means net
-    chips positive summed across the WHOLE challenge, not just the final
-    hand -- a long enough sample that the outcome is actually about
-    skill, not a single lucky showdown. The challenge itself is played
-    with ordinary practice chips: the entry fee is the only real money
-    that changes hands going in, so a challenger's risk is capped at
-    exactly what they agreed to pay, never more. Win, and the challenge
-    pays out from the prize pool (see /prize-pool) -- lose, and the entry
-    fee stays with the house, same as it would if you never win a
-    fairground game."""
+    """Starts a free exam against the hard bot for the chosen game
+    (cfr_bot for leduc, boss_duel_bot for duel), over a fixed number of
+    hands/fights. Passing means net chips positive summed across the WHOLE
+    exam, not just the final hand -- a long enough sample that the result
+    is about skill, not one lucky showdown."""
     bot, err = _require_bot()
     if err:
         return err
@@ -1284,22 +1093,15 @@ def create_boss_challenge():
     game_type = str(body.get("game_type", "")).strip().lower()
     if game_type not in BOSS_CHALLENGE_BOSS_NAME:
         return jsonify(error=f"game_type must be one of {sorted(BOSS_CHALLENGE_BOSS_NAME)}"), 400
-    entry_fee_cents = int(body.get("entry_fee_cents", BOSS_CHALLENGE_ENTRY_FEE_DEFAULT_CENTS))
-    if not (BOSS_CHALLENGE_ENTRY_FEE_MIN_CENTS <= entry_fee_cents <= BOSS_CHALLENGE_ENTRY_FEE_MAX_CENTS):
-        return jsonify(error=f"entry_fee_cents must be between {BOSS_CHALLENGE_ENTRY_FEE_MIN_CENTS} and {BOSS_CHALLENGE_ENTRY_FEE_MAX_CENTS}"), 400
 
     boss_name = BOSS_CHALLENGE_BOSS_NAME[game_type]
     length = BOSS_CHALLENGE_LENGTH[game_type]
-    prize_cents = entry_fee_cents * BOSS_CHALLENGE_PRIZE_MULTIPLIER
 
     with _lock:
         try:
             with db.connect() as conn:
-                if bot["real_balance"] < entry_fee_cents:
-                    return jsonify(error=f"insufficient real_balance ({bot['real_balance']} cents) to pay a {entry_fee_cents}-cent entry fee"), 400
                 factories = BASELINE_BOT_FACTORIES if game_type == "leduc" else DUEL_BASELINE_BOT_FACTORIES
                 opponent_bot_id, opponent_name, _ = _resolve_opponent(conn, boss_name, factories)
-                db.pay_challenge_entry_fee(conn, bot["id"], entry_fee_cents)
                 # The challenge is won or lost on net chips over the match,
                 # never on whether the challenger's (or the boss's --
                 # baseline bots share one account across every match ever
@@ -1312,7 +1114,7 @@ def create_boss_challenge():
                 match_id = db.create_match(conn, bot["id"], opponent_bot_id, length, BOSS_CHALLENGE_RAKE_BPS, "practice_chips", 1, game_type=game_type)
                 challenge_id = db.create_boss_challenge(
                     conn, bot["id"], game_type, boss_name, match_id,
-                    entry_fee_cents, prize_cents, win_condition="net_positive_over_challenge",
+                    win_condition="net_positive_over_challenge",
                 )
         except ValueError as exc:
             return jsonify(error=str(exc)), 400
@@ -1337,10 +1139,8 @@ def create_boss_challenge():
         match_id=match_id,
         boss=opponent_name,
         length=length,
-        entry_fee_cents=entry_fee_cents,
-        prize_cents=prize_cents,
         play_at=play_at,
-        note="win condition is net chips positive summed over the whole challenge, not just the last hand",
+        note="free exam: pass by finishing net chips positive over the whole exam, not just the last hand",
     ), 201
 
 

@@ -41,17 +41,7 @@ class TestDuelAPI(unittest.TestCase):
         return self.client.post("/bots", json={"name": name}).get_json()
 
     def _fund(self, bot, amount_cents=10000):
-        """Competitive (bot vs bot) duel play needs a real usd wager (see
-        _check_wager_policy in api/app.py), which needs real_balance an
-        admin actually credited -- the same admin-attested pattern
-        test_real_value_stub.py exercises for Leduc."""
-        os.environ["ARENA_ADMIN_SECRET"] = ADMIN_SECRET
-        resp = self.client.post(
-            f"/admin/bots/{bot['id']}/credit",
-            json={"amount_cents": amount_cents, "note": "test funding"},
-            headers={"X-Admin-Secret": ADMIN_SECRET},
-        )
-        self.assertEqual(resp.status_code, 200, resp.get_json())
+        """No-op: bot-vs-bot play is free now (practice chips only)."""
 
     def test_cannot_register_a_duel_baseline_name(self):
         resp = self.client.post("/bots", json={"name": "boss_duel_bot"})
@@ -105,10 +95,10 @@ class TestDuelAPI(unittest.TestCase):
         headers_a = {"X-API-Key": bot_a["api_key"]}
         headers_b = {"X-API-Key": bot_b["api_key"]}
 
-        resp = self.client.post("/duel/lobby/join", json={"fights": 2, "rake_bps": 0, "currency": "usd"}, headers=headers_a)
+        resp = self.client.post("/duel/lobby/join", json={"fights": 2, "rake_bps": 0}, headers=headers_a)
         self.assertEqual(resp.get_json()["matched"], False)
 
-        resp = self.client.post("/duel/lobby/join", json={"fights": 2, "rake_bps": 0, "currency": "usd"}, headers=headers_b)
+        resp = self.client.post("/duel/lobby/join", json={"fights": 2, "rake_bps": 0}, headers=headers_b)
         self.assertEqual(resp.get_json()["matched"], True)
         match_id = resp.get_json()["match_id"]
 
@@ -152,34 +142,29 @@ class TestDuelAPI(unittest.TestCase):
         headers_a = {"X-API-Key": bot_a["api_key"]}
         headers_b = {"X-API-Key": bot_b["api_key"]}
 
-        self.client.post("/duel/lobby/join", json={"fights": 5, "rake_bps": 100, "currency": "usd"}, headers=headers_a)
-        resp = self.client.post("/lobby/join", json={"hands": 5, "rake_bps": 100, "currency": "usd"}, headers=headers_b)
+        self.client.post("/duel/lobby/join", json={"fights": 5, "rake_bps": 100}, headers=headers_a)
+        resp = self.client.post("/lobby/join", json={"hands": 5, "rake_bps": 100}, headers=headers_b)
         # bot_b joined the LEDUC lobby with matching hands/rake but bot_a
         # is waiting in the DUEL lobby -- they must not be paired.
         self.assertEqual(resp.get_json()["matched"], False)
 
     def test_duel_lobby_join_is_free_and_instant_against_the_computer(self):
-        """The other half of the wager policy for Duel: a practice_chips
-        /duel/lobby/join (the default -- no currency needs to be passed)
-        is matched against a baseline duel bot immediately, generating a
-        playable match with no wait and no real money involved."""
+        """Asking for the computer skips the queue."""
         bot = self._register("duel_api_bot_free_computer")
         headers = {"X-API-Key": bot["api_key"]}
-        resp = self.client.post("/duel/lobby/join", json={"fights": 2, "rake_bps": 0}, headers=headers)
+        resp = self.client.post("/duel/lobby/join", json={"fights": 2, "vs_computer": True}, headers=headers)
         data = resp.get_json()
         self.assertTrue(data["matched"])
         self.assertIn(data["opponent"], ("random_duel_bot", "heuristic_duel_bot", "boss_duel_bot"))
 
-    def test_duel_match_needs_a_real_wager_against_another_bot(self):
-        """A direct /duel/matches request against another bot's id, with
-        no currency (so the default practice_chips), must be refused --
-        competitive duel play needs currency=usd, same as Leduc."""
+    def test_duel_against_another_bot_is_free(self):
+        """Bot-vs-bot duels are free and played for practice chips."""
         bot_a = self._register("duel_api_bot_wager_a")
         bot_b = self._register("duel_api_bot_wager_b")
         headers_a = {"X-API-Key": bot_a["api_key"]}
         resp = self.client.post("/duel/matches", json={"opponent": str(bot_b["id"]), "fights": 2}, headers=headers_a)
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("wager", resp.get_json()["error"])
+        self.assertEqual(resp.status_code, 201, resp.get_json())
+        self.assertEqual(resp.get_json()["currency"], "practice_chips")
 
     def test_duel_match_survives_a_simulated_restart(self):
         """Same proof as test_durability_and_lobby.py's leduc version:
@@ -233,11 +218,11 @@ class TestDuelAPI(unittest.TestCase):
         headers_b = {"X-API-Key": bot_b["api_key"]}
         headers_c = {"X-API-Key": bot_c["api_key"]}
 
-        self.client.post("/duel/lobby/join", json={"fights": 3, "rake_bps": 0, "stake": 50, "currency": "usd"}, headers=headers_a)
-        resp = self.client.post("/duel/lobby/join", json={"fights": 3, "rake_bps": 0, "stake": 10, "currency": "usd"}, headers=headers_b)
+        self.client.post("/duel/lobby/join", json={"fights": 3, "rake_bps": 0, "stake": 50}, headers=headers_a)
+        resp = self.client.post("/duel/lobby/join", json={"fights": 3, "rake_bps": 0, "stake": 10}, headers=headers_b)
         self.assertEqual(resp.get_json()["matched"], False)  # different stake -- must not pair
 
-        resp2 = self.client.post("/duel/lobby/join", json={"fights": 3, "rake_bps": 0, "stake": 50, "currency": "usd"}, headers=headers_c)
+        resp2 = self.client.post("/duel/lobby/join", json={"fights": 3, "rake_bps": 0, "stake": 50}, headers=headers_c)
         self.assertEqual(resp2.get_json()["matched"], True)  # same stake as bot_a -- must pair
 
     def test_leaderboard_reflects_both_games(self):

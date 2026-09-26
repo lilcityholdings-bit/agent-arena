@@ -79,26 +79,17 @@ class TestAPI(unittest.TestCase):
         summary = self.client.get(f"/matches/{match_id}").get_json()
         self.assertEqual(len(summary["hands"]), 20)
 
-        board = self.client.get("/leaderboard").get_json()
-        self.assertGreater(board["house_rake_collected"], 0)
+        # No rake: every chip one side lost, the other side won.
+        self.assertEqual(sum(h["rake"] for h in summary["hands"]), 0)
+        self.assertEqual(sum(h["payoff_seat0"] + h["payoff_seat1"] for h in summary["hands"]), 0)
 
     def test_remote_vs_remote_match_both_sides_poll(self):
-        # Competitive (bot-vs-bot) play requires a real wager -- see
-        # _check_wager_policy in api/app.py -- so this needs currency=usd
-        # and both sides actually funded, same as test_real_value_stub.py's
-        # usd-match tests. A practice_chips match against another bot id
-        # is covered separately by test_bot_vs_bot_match_needs_a_real_wager.
-        os.environ["ARENA_ADMIN_SECRET"] = ADMIN_SECRET
-        admin_headers = {"X-Admin-Secret": ADMIN_SECRET}
         bot_a = self._register("smoketest_bot_b")
         bot_b = self._register("smoketest_bot_c")
-        for bot in (bot_a, bot_b):
-            resp = self.client.post(f"/admin/bots/{bot['id']}/credit", json={"amount_cents": 10000, "note": "test funding"}, headers=admin_headers)
-            self.assertEqual(resp.status_code, 200)
         headers_a = {"X-API-Key": bot_a["api_key"]}
         headers_b = {"X-API-Key": bot_b["api_key"]}
 
-        resp = self.client.post("/matches", json={"opponent": str(bot_b["id"]), "hands": 10, "currency": "usd"}, headers=headers_a)
+        resp = self.client.post("/matches", json={"opponent": str(bot_b["id"]), "hands": 10}, headers=headers_a)
         self.assertEqual(resp.status_code, 201, resp.get_json())
         match_id = resp.get_json()["match_id"]
 
@@ -125,20 +116,15 @@ class TestAPI(unittest.TestCase):
         summary = self.client.get(f"/matches/{match_id}").get_json()
         self.assertEqual(len(summary["hands"]), 10)
 
-    def test_bot_vs_bot_match_needs_a_real_wager(self):
-        """The traffic-generation policy: the computer is free, but
-        competitive (bot vs bot) play requires an actual wager. A direct
-        /matches request against another bot's id, with no currency (so
-        the default practice_chips), must be refused -- practice_chips
-        isn't a real wager, it's the free currency every bot starts
-        with."""
+    def test_bot_vs_bot_match_is_free(self):
+        """Playing another bot is free and uses practice chips, same as the computer."""
         bot_a = self._register("smoketest_bot_wager_a")
         bot_b = self._register("smoketest_bot_wager_b")
         headers_a = {"X-API-Key": bot_a["api_key"]}
 
         resp = self.client.post("/matches", json={"opponent": str(bot_b["id"]), "hands": 10}, headers=headers_a)
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("wager", resp.get_json()["error"])
+        self.assertEqual(resp.status_code, 201, resp.get_json())
+        self.assertEqual(resp.get_json()["currency"], "practice_chips")
 
     def test_playing_the_computer_is_free_by_default(self):
         """The other half of the same policy: no currency needs to be
@@ -166,9 +152,9 @@ class TestAPI(unittest.TestCase):
         random_bot_row = next(b for b in board["bots"] if b["name"] == "random_bot")
         baseline_id = random_bot_row["id"]
 
-        resp = self.client.post("/matches", json={"opponent": str(baseline_id), "hands": 1, "currency": "usd"}, headers=headers)
-        self.assertEqual(resp.status_code, 400)
-        self.assertIn("free", resp.get_json()["error"])
+        resp = self.client.post("/matches", json={"opponent": str(baseline_id), "hands": 1}, headers=headers)
+        self.assertEqual(resp.status_code, 201, resp.get_json())
+        self.assertEqual(resp.get_json()["opponent"], "random_bot")
 
 
 if __name__ == "__main__":

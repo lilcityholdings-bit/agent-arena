@@ -26,12 +26,9 @@
 </head>
 <body>
   <h1>Agent Arena</h1>
-  <div class="sub">Bots play Leduc Hold'em against each other. Practice-chip matches are free to play; real_balance (shown in cents) only moves via an admin-attested credit/debit or a usd match. The house takes a rake from every pot, in whichever currency it was played. Refreshes every 10s.</div>
+  <div class="sub">Bots play Leduc Hold'em against each other. Every match is free and played for practice chips, which have no cash value. Refreshes every 10s.</div>
 
   <div class="cards">
-    <div class="card"><div class="label">House rake (practice chips)</div><div class="value">{{ house_rake }}</div></div>
-    <div class="card"><div class="label">House rake (real, cents)</div><div class="value">{{ real_house_rake_cents }}</div></div>
-    <div class="card"><div class="label">Prize pool (real, cents)</div><div class="value">{{ prize_pool_cents }}</div></div>
     <div class="card"><div class="label">Registered bots</div><div class="value">{{ bots|length }}</div></div>
     <div class="card"><div class="label">Matches played</div><div class="value">{{ matches|length }}</div></div>
   </div>
@@ -39,13 +36,12 @@
   <section>
     <h2>Leaderboard</h2>
     <table>
-      <tr><th>#</th><th>Bot</th><th>Balance</th><th>Real balance</th></tr>
+      <tr><th>#</th><th>Bot</th><th>Balance</th></tr>
       {% for b in bots %}
       <tr>
         <td>{{ loop.index }}</td>
         <td>{{ b.name }}</td>
         <td>{{ b.balance }}</td>
-        <td>{{ b.real_balance }}</td>
       </tr>
       {% endfor %}
     </table>
@@ -54,7 +50,7 @@
   <section>
     <h2>Recent matches</h2>
     <table>
-      <tr><th>ID</th><th>Game</th><th>Bot A</th><th>Bot B</th><th>Hands</th><th>Rake bps</th><th>Currency</th><th>Status</th></tr>
+      <tr><th>ID</th><th>Game</th><th>Bot A</th><th>Bot B</th><th>Hands</th><th>Status</th></tr>
       {% for m in matches %}
       <tr>
         <td>{{ m.id }}</td>
@@ -62,8 +58,6 @@
         <td>{{ m.bot_a_name }}</td>
         <td>{{ m.bot_b_name }}</td>
         <td>{{ m.hands_played }} / {{ m.hands_requested }}</td>
-        <td>{{ m.rake_bps }}</td>
-        <td>{{ m.currency }}{% if m.currency == 'usd' %} (${{ '%.2f'|format(m.unit_value_cents / 100) }}/unit){% endif %}</td>
         <td class="status-{{ m.status }}">{{ m.status }}</td>
       </tr>
       {% endfor %}

@@ -105,27 +105,16 @@ class TestLobby(unittest.TestCase):
         return resp.get_json()
 
     def test_two_bots_auto_pair_in_the_lobby(self):
-        """Competitive (bot vs bot) lobby pairing requires a real wager --
-        currency=usd, with both sides actually funded -- same policy as
-        the direct /matches route (see _check_wager_policy in
-        api/app.py). Without that, a practice_chips join can never be
-        paired with another real bot; it's matched against the computer
-        instead (see test_lobby_join_is_free_and_instant_against_the_
-        computer below)."""
-        os.environ["ARENA_ADMIN_SECRET"] = ADMIN_SECRET
-        admin_headers = {"X-Admin-Secret": ADMIN_SECRET}
+        """Two bots joining the lobby are paired with each other, free."""
         bot_a = self._register("lobby_bot_a")
         bot_b = self._register("lobby_bot_b")
-        for bot in (bot_a, bot_b):
-            resp = self.client.post(f"/admin/bots/{bot['id']}/credit", json={"amount_cents": 10000, "note": "test funding"}, headers=admin_headers)
-            self.assertEqual(resp.status_code, 200)
         headers_a = {"X-API-Key": bot_a["api_key"]}
         headers_b = {"X-API-Key": bot_b["api_key"]}
 
-        r1 = self.client.post("/lobby/join", json={"hands": 5, "rake_bps": 500, "currency": "usd"}, headers=headers_a)
+        r1 = self.client.post("/lobby/join", json={"hands": 5, "rake_bps": 500}, headers=headers_a)
         self.assertFalse(r1.get_json()["matched"])  # nobody else waiting yet
 
-        r2 = self.client.post("/lobby/join", json={"hands": 5, "rake_bps": 500, "currency": "usd"}, headers=headers_b)
+        r2 = self.client.post("/lobby/join", json={"hands": 5, "rake_bps": 500}, headers=headers_b)
         data2 = r2.get_json()
         self.assertTrue(data2["matched"])  # bot_b's join should find bot_a waiting
         match_id = data2["match_id"]
@@ -137,40 +126,36 @@ class TestLobby(unittest.TestCase):
         self.assertEqual(status["match_id"], match_id)
 
     def test_lobby_join_is_free_and_instant_against_the_computer(self):
-        """practice_chips is the free-to-play-the-computer currency, so a
-        /lobby/join with no currency specified (the default) is matched
-        against a baseline bot immediately -- no waiting, since a
-        practice_chips entry could never be a competitive (real-wager)
-        pairing anyway."""
+        """Asking for the computer skips the queue."""
         bot = self._register("lonely_bot")
         headers = {"X-API-Key": bot["api_key"]}
-        r = self.client.post("/lobby/join", json={"hands": 3, "rake_bps": 500}, headers=headers)
+        r = self.client.post("/lobby/join", json={"hands": 3, "vs_computer": True}, headers=headers)
         data = r.get_json()
         self.assertTrue(data["matched"])
         self.assertIn(data["opponent"], ("random_bot", "heuristic_bot"))
 
-    def test_usd_lobby_entry_waits_and_never_falls_back_to_the_computer(self):
-        """The other half of the policy: a usd (competitive) lobby entry
-        must never be quietly handed a free baseline opponent, however
-        long it waits -- that would let bot-vs-bot play dodge the real
-        wager requirement."""
-        os.environ["ARENA_ADMIN_SECRET"] = ADMIN_SECRET
-        admin_headers = {"X-Admin-Secret": ADMIN_SECRET}
-        bot = self._register("lonely_wager_bot")
-        resp = self.client.post(f"/admin/bots/{bot['id']}/credit", json={"amount_cents": 10000, "note": "test funding"}, headers=admin_headers)
-        self.assertEqual(resp.status_code, 200)
+    def test_a_lonely_bot_waits_then_plays_the_computer(self):
+        """A bot alone in the lobby waits for a real opponent, and after
+        fallback_after_seconds it's matched against the computer instead of
+        waiting forever."""
+        bot = self._register("lonely_waiting_bot")
         headers = {"X-API-Key": bot["api_key"]}
-
-        r = self.client.post(
-            "/lobby/join",
-            json={"hands": 3, "rake_bps": 500, "currency": "usd", "fallback_after_seconds": 0},
-            headers=headers,
-        )
+        r = self.client.post("/lobby/join", json={"hands": 3, "fallback_after_seconds": 60}, headers=headers)
         self.assertFalse(r.get_json()["matched"])
-
         status = self.client.get("/lobby/status", headers=headers).get_json()
         self.assertFalse(status["matched"])
         self.assertTrue(status["waiting"])
+
+        other = self._register("lonely_fallback_bot")
+        headers2 = {"X-API-Key": other["api_key"]}
+        self.client.post("/lobby/leave", headers=headers)
+        r = self.client.post("/lobby/join", json={"hands": 3, "fallback_after_seconds": 0}, headers=headers2)
+        self.assertFalse(r.get_json()["matched"])
+        status = self.client.get("/lobby/status", headers=headers2).get_json()
+        self.assertTrue(status["matched"], status)
+        self.assertIn(status["opponent"], ("random_bot", "heuristic_bot"))
+        state = self.client.get(f"/matches/{status['match_id']}/state", headers=headers2)
+        self.assertEqual(state.status_code, 200)
 
 
 if __name__ == "__main__":

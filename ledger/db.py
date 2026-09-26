@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import hashlib
 import secrets
 import sqlite3
 import time
@@ -231,19 +232,30 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
         _ensure_column(conn, "live_matches", "game_type", "TEXT NOT NULL DEFAULT 'leduc'")
         _ensure_column(conn, "lobby_entries", "game_type", "TEXT NOT NULL DEFAULT 'leduc'")
         _ensure_column(conn, "lobby_entries", "stake", "INTEGER NOT NULL DEFAULT 1")
+        # Databases from before keys were hashed: hash any key still stored raw
+        # (raw keys are 32 hex characters; hashes are 64).
+        for row in conn.execute("SELECT id, api_key FROM bots WHERE length(api_key) != 64").fetchall():
+            conn.execute("UPDATE bots SET api_key = ? WHERE id = ?", (hash_key(row["api_key"]), row["id"]))
+
+
+def hash_key(api_key: str) -> str:
+    """API keys are stored only as their SHA-256, so a copy of the database
+    doesn't hand anyone every bot's key."""
+    return hashlib.sha256(api_key.encode()).hexdigest()
 
 
 def create_bot(conn: sqlite3.Connection, name: str, starting_balance: int = 1000) -> dict:
+    """Returns the raw api_key exactly once; only its hash is stored."""
     api_key = secrets.token_hex(16)
     cur = conn.execute(
         "INSERT INTO bots (name, api_key, balance, real_balance, created_at) VALUES (?, ?, ?, 0, ?)",
-        (name, api_key, starting_balance, time.time()),
+        (name, hash_key(api_key), starting_balance, time.time()),
     )
-    return {"id": cur.lastrowid, "name": name, "api_key": api_key, "balance": starting_balance, "real_balance": 0}
+    return {"id": cur.lastrowid, "name": name, "api_key": api_key, "balance": starting_balance}
 
 
 def get_bot_by_api_key(conn: sqlite3.Connection, api_key: str) -> sqlite3.Row | None:
-    return conn.execute("SELECT * FROM bots WHERE api_key = ?", (api_key,)).fetchone()
+    return conn.execute("SELECT * FROM bots WHERE api_key = ?", (hash_key(api_key),)).fetchone()
 
 
 def get_bot(conn: sqlite3.Connection, bot_id: int) -> sqlite3.Row | None:
@@ -365,46 +377,6 @@ def _record_real_value_transaction(
            VALUES (?, ?, ?, ?, ?, ?)""",
         (bot_id, delta_cents, reason, admin_note, match_id, time.time()),
     )
-
-
-def credit_real_balance(conn: sqlite3.Connection, bot_id: int, amount_cents: int, admin_note: str) -> dict:
-    """Records that real value actually moved to this bot from outside
-    the app (e.g. an admin received a bank/crypto transfer and is
-    attesting to it here). Never call this without that having actually
-    happened -- there is no other source of truth behind this number."""
-    if amount_cents <= 0:
-        raise ValueError("amount_cents must be positive")
-    conn.execute("UPDATE bots SET real_balance = real_balance + ? WHERE id = ?", (amount_cents, bot_id))
-    _record_real_value_transaction(conn, bot_id, amount_cents, reason="admin_credit", admin_note=admin_note)
-    return dict(get_bot(conn, bot_id))
-
-
-def debit_real_balance(conn: sqlite3.Connection, bot_id: int, amount_cents: int, admin_note: str) -> dict:
-    """Inverse of credit_real_balance -- records real value actually paid
-    out to this bot's owner. Refuses to take a bot's real_balance
-    negative; that would mean recording a payout that didn't happen."""
-    if amount_cents <= 0:
-        raise ValueError("amount_cents must be positive")
-    bot = get_bot(conn, bot_id)
-    if bot is None:
-        raise ValueError(f"no such bot {bot_id}")
-    if bot["real_balance"] < amount_cents:
-        raise ValueError(f"bot only has {bot['real_balance']} real cents, cannot debit {amount_cents}")
-    conn.execute("UPDATE bots SET real_balance = real_balance - ? WHERE id = ?", (amount_cents, bot_id))
-    _record_real_value_transaction(conn, bot_id, -amount_cents, reason="admin_debit", admin_note=admin_note)
-    return dict(get_bot(conn, bot_id))
-
-
-def real_value_transactions(conn: sqlite3.Connection, bot_id: int, limit: int = 100) -> list[sqlite3.Row]:
-    return conn.execute(
-        "SELECT * FROM real_value_transactions WHERE bot_id = ? ORDER BY id DESC LIMIT ?",
-        (bot_id, limit),
-    ).fetchall()
-
-
-def real_house_balance(conn: sqlite3.Connection) -> int:
-    row = conn.execute("SELECT real_rake_balance FROM house WHERE id = 1").fetchone()
-    return row["real_rake_balance"]
 
 
 def finish_match(conn: sqlite3.Connection, match_id: int) -> None:
@@ -539,35 +511,16 @@ def recent_matches(conn: sqlite3.Connection, limit: int = 25) -> list[sqlite3.Ro
 # engine, same bankroll caps, same conservation guarantees); this layer
 # only adds the fixed entry fee and the pass/fail prize payout on top.
 
-def fund_prize_pool(conn: sqlite3.Connection, amount_cents: int, admin_note: str) -> int:
-    """An admin moving real value they've actually collected into the
-    prize pool (the same honest-attestation pattern as credit_real_balance
-    -- this doesn't create money, it records money that was actually set
-    aside). Returns the new pool balance."""
-    if amount_cents <= 0:
-        raise ValueError("amount_cents must be positive")
-    conn.execute("UPDATE prize_pool SET balance_cents = balance_cents + ? WHERE id = 1", (amount_cents,))
-    conn.execute(
-        """INSERT INTO prize_pool_transactions (delta_cents, reason, note, challenge_id, created_at)
-           VALUES (?, 'admin_funding', ?, NULL, ?)""",
-        (amount_cents, admin_note, time.time()),
-    )
-    return prize_pool_balance(conn)
-
-
-def prize_pool_balance(conn: sqlite3.Connection) -> int:
-    return conn.execute("SELECT balance_cents FROM prize_pool WHERE id = 1").fetchone()["balance_cents"]
-
-
 def create_boss_challenge(
     conn: sqlite3.Connection, bot_id: int, game_type: str, boss_name: str, match_id: int,
-    entry_fee_cents: int, prize_cents: int, win_condition: str,
+    win_condition: str,
 ) -> int:
+    """A free exam: the fee and prize columns are kept for old databases and always 0."""
     cur = conn.execute(
         """INSERT INTO boss_challenges
            (bot_id, game_type, boss_name, match_id, entry_fee_cents, prize_cents, win_condition, status, created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
-        (bot_id, game_type, boss_name, match_id, entry_fee_cents, prize_cents, win_condition, time.time()),
+           VALUES (?, ?, ?, ?, 0, 0, ?, 'pending', ?)""",
+        (bot_id, game_type, boss_name, match_id, win_condition, time.time()),
     )
     return cur.lastrowid
 
@@ -577,40 +530,16 @@ def get_boss_challenge(conn: sqlite3.Connection, challenge_id: int) -> sqlite3.R
 
 
 def resolve_boss_challenge(conn: sqlite3.Connection, challenge_id: int, won: bool) -> dict:
-    """Pays out the prize from the prize pool on a win (refuses to pay
-    more than the pool actually holds -- an underfunded pool means the
-    challenge honestly can't pay, not a payout that overdraws it), and
-    marks the challenge resolved either way. Idempotent: resolving an
-    already-resolved challenge again raises rather than double-paying."""
+    """Marks an exam passed ("won") or failed ("lost"). Nothing is paid.
+    Resolving an already-resolved exam again raises."""
     challenge = get_boss_challenge(conn, challenge_id)
     if challenge is None:
         raise ValueError(f"no such challenge {challenge_id}")
     if challenge["status"] != "pending":
         raise ValueError(f"challenge {challenge_id} already resolved as {challenge['status']}")
-
-    status = "won" if won else "lost"
-    if won:
-        pool = prize_pool_balance(conn)
-        prize = challenge["prize_cents"]
-        if pool < prize:
-            # Honest failure mode: don't pretend to pay out more than the
-            # house has actually set aside. Pay what's available and log
-            # exactly that, rather than silently overdrawing the pool.
-            prize = pool
-        conn.execute("UPDATE prize_pool SET balance_cents = balance_cents - ? WHERE id = 1", (prize,))
-        conn.execute("UPDATE bots SET real_balance = real_balance + ? WHERE id = ?", (prize, challenge["bot_id"]))
-        _record_real_value_transaction(
-            conn, challenge["bot_id"], prize, reason="boss_challenge_prize",
-            admin_note=f"challenge #{challenge_id} vs {challenge['boss_name']}", match_id=challenge["match_id"],
-        )
-        conn.execute(
-            """INSERT INTO prize_pool_transactions (delta_cents, reason, note, challenge_id, created_at)
-               VALUES (?, 'challenge_payout', ?, ?, ?)""",
-            (-prize, f"paid to bot {challenge['bot_id']}", challenge_id, time.time()),
-        )
     conn.execute(
         "UPDATE boss_challenges SET status = ?, resolved_at = ? WHERE id = ?",
-        (status, time.time(), challenge_id),
+        ("won" if won else "lost", time.time(), challenge_id),
     )
     return dict(get_boss_challenge(conn, challenge_id))
 
@@ -640,20 +569,3 @@ def ensure_minimum_practice_balance(conn: sqlite3.Connection, bot_id: int, minim
         conn.execute("UPDATE bots SET balance = ? WHERE id = ?", (minimum, bot_id))
 
 
-def pay_challenge_entry_fee(conn: sqlite3.Connection, bot_id: int, amount_cents: int) -> dict:
-    """The entry fee IS the house's revenue from a challenge (there's no
-    separate rake on top -- see api/app.py's challenge endpoint) -- it
-    moves straight from the bot's real_balance to the house's
-    real_rake_balance, logged the same honest way as every other
-    real-value movement here."""
-    if amount_cents <= 0:
-        raise ValueError("amount_cents must be positive")
-    bot = get_bot(conn, bot_id)
-    if bot is None:
-        raise ValueError(f"no such bot {bot_id}")
-    if bot["real_balance"] < amount_cents:
-        raise ValueError(f"bot only has {bot['real_balance']} real cents, cannot pay a {amount_cents}-cent entry fee")
-    conn.execute("UPDATE bots SET real_balance = real_balance - ? WHERE id = ?", (amount_cents, bot_id))
-    conn.execute("UPDATE house SET real_rake_balance = real_rake_balance + ?", (amount_cents,))
-    _record_real_value_transaction(conn, bot_id, -amount_cents, reason="boss_challenge_entry_fee", admin_note=None)
-    return dict(get_bot(conn, bot_id))
