@@ -80,10 +80,12 @@ class LeducHand:
     result: HandResult | None = field(default=None, init=False)
     action_history: list = field(default_factory=list, init=False)
 
-    def start(self) -> None:
+    def start(self, deck: list | None = None) -> None:
+        """Deals the hand. Pass `deck` (e.g. from cards.deck_from_seeds) to use a
+        provably fair order instead of shuffling with self.rng."""
         if min(self.stacks[0], self.stacks[1]) < ANTE:
             raise IllegalAction("a player's stack is too small to even post the ante")
-        self._deck = new_shuffled_deck(self.rng)
+        self._deck = list(deck) if deck is not None else new_shuffled_deck(self.rng)
         self.hole = {0: self._deck.pop(), 1: self._deck.pop()}
         # The board card is drawn now too (not when round 2 starts) so a
         # hand's entire outcome is determined by its RNG draw at start()

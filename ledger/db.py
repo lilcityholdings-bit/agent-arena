@@ -198,6 +198,42 @@ CREATE TABLE IF NOT EXISTS prize_pool_transactions (
     created_at REAL NOT NULL
 );
 
+-- Skill ratings (Elo), one per bot per game ("poker" / "duel"). House bots
+-- are never stored here: their ratings are fixed in api/app.py.
+CREATE TABLE IF NOT EXISTS ratings (
+    bot_id INTEGER NOT NULL REFERENCES bots(id),
+    game TEXT NOT NULL,
+    rating REAL NOT NULL,
+    games INTEGER NOT NULL DEFAULT 0,
+    wins INTEGER NOT NULL DEFAULT 0,
+    losses INTEGER NOT NULL DEFAULT 0,
+    draws INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (bot_id, game)
+);
+
+-- How many rated games each pair of (non-house) bots has played today, so two
+-- bots can't farm rating off each other.
+CREATE TABLE IF NOT EXISTS rated_pairs (
+    day TEXT NOT NULL,
+    low_id INTEGER NOT NULL,
+    high_id INTEGER NOT NULL,
+    games INTEGER NOT NULL,
+    PRIMARY KEY (day, low_id, high_id)
+);
+
+-- The /play queue (api/play.py). target_bot_id NULL means "anyone"; set, it
+-- means "only this bot", and the two are matched only when both have named
+-- each other, so no bot can be dragged into a match it didn't agree to.
+CREATE TABLE IF NOT EXISTS play_queue (
+    bot_id INTEGER NOT NULL REFERENCES bots(id),
+    game_type TEXT NOT NULL,
+    target_bot_id INTEGER,
+    joined_at REAL NOT NULL,
+    fallback_after REAL,
+    PRIMARY KEY (bot_id, game_type)
+);
+
 -- The negotiation exam (engine/negotiation.py): one row per exam, one row per
 -- negotiation in it. A negotiation's whole state is JSON, written on every
 -- turn, so an exam survives a restart the same way a live match does.
@@ -254,6 +290,12 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
         _ensure_column(conn, "live_matches", "game_type", "TEXT NOT NULL DEFAULT 'leduc'")
         _ensure_column(conn, "lobby_entries", "game_type", "TEXT NOT NULL DEFAULT 'leduc'")
         _ensure_column(conn, "lobby_entries", "stake", "INTEGER NOT NULL DEFAULT 1")
+        # Who registered the bot (a hash of their network address, never the
+        # address itself): bots with the same owner can't rate each other.
+        _ensure_column(conn, "bots", "owner_hash", "TEXT")
+        # "free" or "pro" -- pro raises the limits in api/play.py.
+        _ensure_column(conn, "bots", "tier", "TEXT NOT NULL DEFAULT 'free'")
+        _ensure_column(conn, "matches", "forfeited_by_bot_id", "INTEGER")
         # Databases from before keys were hashed: hash any key still stored raw
         # (raw keys are 32 hex characters; hashes are 64).
         for row in conn.execute("SELECT id, api_key FROM bots WHERE length(api_key) != 64").fetchall():
@@ -266,12 +308,12 @@ def hash_key(api_key: str) -> str:
     return hashlib.sha256(api_key.encode()).hexdigest()
 
 
-def create_bot(conn: sqlite3.Connection, name: str, starting_balance: int = 1000) -> dict:
+def create_bot(conn: sqlite3.Connection, name: str, starting_balance: int = 1000, owner_hash: str | None = None) -> dict:
     """Returns the raw api_key exactly once; only its hash is stored."""
     api_key = secrets.token_hex(16)
     cur = conn.execute(
-        "INSERT INTO bots (name, api_key, balance, real_balance, created_at) VALUES (?, ?, ?, 0, ?)",
-        (name, hash_key(api_key), starting_balance, time.time()),
+        "INSERT INTO bots (name, api_key, balance, real_balance, created_at, owner_hash) VALUES (?, ?, ?, 0, ?, ?)",
+        (name, hash_key(api_key), starting_balance, time.time(), owner_hash),
     )
     return {"id": cur.lastrowid, "name": name, "api_key": api_key, "balance": starting_balance}
 
@@ -648,3 +690,171 @@ def negotiation_exam_stats(conn: sqlite3.Connection) -> dict:
         "SELECT COUNT(finished_at) AS finished, COALESCE(SUM(passed), 0) AS passed FROM negotiation_exams"
     ).fetchone()
     return {"finished": row["finished"], "passed": row["passed"]}
+
+
+# ---- ratings ------------------------------------------------------------------------------
+
+START_RATING = 1000.0
+
+
+def get_rating(conn: sqlite3.Connection, bot_id: int, game: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM ratings WHERE bot_id = ? AND game = ?", (bot_id, game)).fetchone()
+
+
+def apply_elo(conn, game: str, a_id: int, b_id: int, score_a: float,
+              fixed_a: float | None = None, fixed_b: float | None = None) -> None:
+    """Standard Elo. A side with a fixed rating (a house bot) isn't stored or
+    moved. K is larger for a bot's first 10 games so new bots settle fast."""
+    def current(bot_id, fixed):
+        if fixed is not None:
+            return float(fixed), None
+        row = get_rating(conn, bot_id, game)
+        return (row["rating"], row["games"]) if row else (START_RATING, 0)
+
+    ra, ga = current(a_id, fixed_a)
+    rb, gb = current(b_id, fixed_b)
+    expected_a = 1 / (1 + 10 ** ((rb - ra) / 400))
+    for bot_id, fixed, rating, games, score, expected in (
+        (a_id, fixed_a, ra, ga, score_a, expected_a),
+        (b_id, fixed_b, rb, gb, 1 - score_a, 1 - expected_a),
+    ):
+        if fixed is not None:
+            continue
+        k = 48 if games < 10 else 24
+        new = rating + k * (score - expected)
+        win, loss, draw = int(score == 1), int(score == 0), int(score == 0.5)
+        conn.execute(
+            """INSERT INTO ratings (bot_id, game, rating, games, wins, losses, draws, updated_at)
+               VALUES (?, ?, ?, 1, ?, ?, ?, ?)
+               ON CONFLICT(bot_id, game) DO UPDATE SET rating = ?, games = games + 1,
+                   wins = wins + ?, losses = losses + ?, draws = draws + ?, updated_at = ?""",
+            (bot_id, game, new, win, loss, draw, time.time(), new, win, loss, draw, time.time()),
+        )
+
+
+def take_rated_pair_slot(conn, a_id: int, b_id: int, limit: int) -> bool:
+    """Counts one rated game between two bots today; False once the pair is
+    at `limit` for the day."""
+    day = time.strftime("%Y-%m-%d", time.gmtime())
+    low, high = min(a_id, b_id), max(a_id, b_id)
+    row = conn.execute("SELECT games FROM rated_pairs WHERE day = ? AND low_id = ? AND high_id = ?", (day, low, high)).fetchone()
+    if row and row["games"] >= limit:
+        return False
+    conn.execute(
+        """INSERT INTO rated_pairs (day, low_id, high_id, games) VALUES (?, ?, ?, 1)
+           ON CONFLICT(day, low_id, high_id) DO UPDATE SET games = games + 1""",
+        (day, low, high),
+    )
+    return True
+
+
+def rating_leaderboard(conn, game: str, limit: int = 50) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT b.id, b.name, r.rating, r.games, r.wins, r.losses, r.draws
+           FROM ratings r JOIN bots b ON b.id = r.bot_id
+           WHERE r.game = ? ORDER BY r.rating DESC LIMIT ?""",
+        (game, limit),
+    ).fetchall()
+
+
+def rating_rank(conn, game: str, bot_id: int) -> int | None:
+    row = get_rating(conn, bot_id, game)
+    if row is None:
+        return None
+    return conn.execute("SELECT COUNT(*) FROM ratings WHERE game = ? AND rating > ?", (game, row["rating"])).fetchone()[0] + 1
+
+
+def count_bots_by_owner_since(conn, owner_hash: str, since: float) -> int:
+    return conn.execute("SELECT COUNT(*) FROM bots WHERE owner_hash = ? AND created_at >= ?", (owner_hash, since)).fetchone()[0]
+
+
+def active_match_ids_for_bot(conn, bot_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT match_id, game_type FROM live_matches WHERE creator_bot_id = ? OR opponent_bot_id = ? ORDER BY match_id",
+        (bot_id, bot_id),
+    ).fetchall()
+
+
+def get_match(conn, match_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM matches WHERE id = ?", (match_id,)).fetchone()
+
+
+def set_forfeit(conn, match_id: int, bot_id: int) -> None:
+    conn.execute("UPDATE matches SET forfeited_by_bot_id = ? WHERE id = ?", (bot_id, match_id))
+
+
+def top_up_practice_chips(conn, bot_id: int, floor: int, amount: int) -> None:
+    """Practice chips have no value, so a bot that runs low is simply refilled
+    rather than locked out of playing."""
+    conn.execute("UPDATE bots SET balance = ? WHERE id = ? AND balance < ?", (amount, bot_id, floor))
+
+
+def set_tier(conn, bot_id: int, tier: str) -> None:
+    conn.execute("UPDATE bots SET tier = ? WHERE id = ?", (tier, bot_id))
+
+
+def bot_recent_matches(conn, bot_id: int, limit: int = 10) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT m.id, m.game_type, m.status, m.hands_played, m.hands_requested, m.started_at, m.forfeited_by_bot_id,
+                  a.name AS bot_a_name, b.name AS bot_b_name, m.bot_a_id, m.bot_b_id
+           FROM matches m JOIN bots a ON a.id = m.bot_a_id JOIN bots b ON b.id = m.bot_b_id
+           WHERE m.bot_a_id = ? OR m.bot_b_id = ? ORDER BY m.id DESC LIMIT ?""",
+        (bot_id, bot_id, limit),
+    ).fetchall()
+
+
+def net_for_bot_in_match(conn, match_id: int, bot_id: int) -> int:
+    net = 0
+    for row in match_history(conn, match_id):
+        if row["seat0_bot_id"] == bot_id:
+            net += row["payoff_seat0"]
+        elif row["seat1_bot_id"] == bot_id:
+            net += row["payoff_seat1"]
+    return net
+
+
+# ---- /play queue --------------------------------------------------------------------------
+
+def queue_join(conn, bot_id: int, game_type: str, target_bot_id: int | None, fallback_seconds: float | None) -> None:
+    now = time.time()
+    conn.execute(
+        """INSERT INTO play_queue (bot_id, game_type, target_bot_id, joined_at, fallback_after) VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(bot_id, game_type) DO UPDATE SET target_bot_id = excluded.target_bot_id,
+               joined_at = excluded.joined_at, fallback_after = excluded.fallback_after""",
+        (bot_id, game_type, target_bot_id, now, None if fallback_seconds is None else now + fallback_seconds),
+    )
+
+
+def queue_leave(conn, bot_id: int, game_type: str | None = None) -> None:
+    if game_type is None:
+        conn.execute("DELETE FROM play_queue WHERE bot_id = ?", (bot_id,))
+    else:
+        conn.execute("DELETE FROM play_queue WHERE bot_id = ? AND game_type = ?", (bot_id, game_type))
+
+
+def queue_entry(conn, bot_id: int, game_type: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM play_queue WHERE bot_id = ? AND game_type = ?", (bot_id, game_type)).fetchone()
+
+
+def queue_find_partner(conn, bot_id: int, game_type: str, target_bot_id: int | None) -> sqlite3.Row | None:
+    """For "anyone": the longest-waiting bot also asking for anyone. For a named
+    bot: that bot, only if it is waiting for this one."""
+    if target_bot_id is None:
+        return conn.execute(
+            """SELECT * FROM play_queue WHERE game_type = ? AND bot_id != ? AND target_bot_id IS NULL
+               ORDER BY joined_at LIMIT 1""",
+            (game_type, bot_id),
+        ).fetchone()
+    return conn.execute(
+        "SELECT * FROM play_queue WHERE game_type = ? AND bot_id = ? AND target_bot_id = ?",
+        (game_type, target_bot_id, bot_id),
+    ).fetchone()
+
+
+def queue_invitations(conn, bot_id: int) -> list[sqlite3.Row]:
+    """Bots currently waiting to play this one by name."""
+    return conn.execute(
+        """SELECT q.game_type, q.joined_at, b.name FROM play_queue q JOIN bots b ON b.id = q.bot_id
+           WHERE q.target_bot_id = ? ORDER BY q.joined_at""",
+        (bot_id,),
+    ).fetchall()

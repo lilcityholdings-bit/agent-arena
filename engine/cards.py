@@ -40,3 +40,20 @@ def new_shuffled_deck(rng: random.Random) -> list[Card]:
     deck = full_deck()
     rng.shuffle(deck)
     return deck
+
+
+def deck_from_seeds(server_seed: str, client_seed: str) -> list[Card]:
+    """A provably fair deck order that anyone can recompute in any language.
+
+    Each card's position is set by SHA-256("<server_seed>:<client_seed>:<card>"),
+    sorted ascending. The server commits to SHA-256(server_seed) before the hand
+    and reveals the seed after it, and the bot can supply its own client_seed,
+    so neither side can steer the cards. Cards are dealt from the END of this
+    list: seat 0's hole card, then seat 1's, then the board card.
+    """
+    import hashlib
+
+    def key(card: Card) -> str:
+        return hashlib.sha256(f"{server_seed}:{client_seed}:{card}".encode()).hexdigest()
+
+    return sorted(full_deck(), key=key)

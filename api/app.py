@@ -13,8 +13,11 @@ Auth: pass your api_key either as header `X-API-Key` or in the JSON body.
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import random
+import re
+import secrets
 import sys
 import threading
 import time
@@ -29,6 +32,7 @@ from bots.random_bot import RandomBot
 from bots.duel_boss_bot import BossDuelBot
 from bots.duel_heuristic_bot import HeuristicDuelBot
 from bots.duel_random_bot import RandomDuelBot
+from engine.cards import deck_from_seeds
 from engine.leduc import ANTE, IllegalAction, LeducHand
 from engine.duel import DuelFight
 from engine import negotiation
@@ -64,6 +68,18 @@ BASELINE_STARTING_BALANCE = 1_000_000
 LOBBY_FALLBACK_BOT = "heuristic_bot"
 LOBBY_DUEL_FALLBACK_BOT = "heuristic_duel_bot"
 LOBBY_DEFAULT_FALLBACK_SECONDS = 20
+
+# Turn clock. A bot that doesn't move within TURN_SECONDS gets a safe
+# automatic move (poker: check, or fold if it can't check; duel: rest), and
+# MAX_TIMEOUTS of those in one match forfeits it. Without this, one bot that
+# crashes or walks away would freeze its opponent's match forever.
+TURN_SECONDS = 30
+MAX_TIMEOUTS = 3
+
+
+def _now() -> float:
+    """Wall clock, behind a function so tests can move time forward."""
+    return time.time()
 
 DEFAULT_STARTING_BALANCE = 1000
 # No rake. Agent Arena is a proving ground, not a casino: nothing is wagered,
@@ -131,6 +147,10 @@ def _all_reserved_names() -> set:
 
 
 def _get_api_key() -> str | None:
+    """X-API-Key header, Authorization: Bearer, or "api_key" in the JSON body."""
+    auth = request.headers.get("Authorization", "")
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
     return request.headers.get("X-API-Key") or (request.get_json(silent=True) or {}).get("api_key")
 
 
@@ -160,22 +180,50 @@ def dashboard():
     return render_template("index.html", bots=bots, matches=matches, exam_stats=exam_stats, agent_count=agent_count)
 
 
+BOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$")
+MAX_REGISTRATIONS_PER_OWNER_PER_DAY = int(os.environ.get("ARENA_MAX_REGISTRATIONS_PER_DAY", "20"))
+
+
+def _client_ip() -> str:
+    """The caller's address. Behind Railway's proxy the real one is the first
+    entry of X-Forwarded-For; run directly, it's the socket's address."""
+    forwarded = request.headers.get("X-Forwarded-For", "")
+    return forwarded.split(",")[0].strip() or request.headers.get("X-Real-IP") or request.remote_addr or "unknown"
+
+
+def _owner_hash() -> str:
+    """Who registered a bot, as a salted hash -- the address itself is never
+    stored. Used only so an owner's bots can't rate each other."""
+    salt = os.environ.get("ARENA_OWNER_SALT", "agent-arena")
+    return hashlib.sha256(f"{salt}:{_client_ip()}".encode()).hexdigest()[:32]
+
+
+def register_bot_record(name: str) -> tuple[dict | None, str | None, int]:
+    """Shared by POST /bots and the MCP register tool. Returns (bot, error, status)."""
+    name = (name or "").strip()
+    if not BOT_NAME_RE.match(name):
+        return None, "name must be 3-32 characters: letters, numbers, and _ . - (starting with a letter or number)", 400
+    if name in _all_reserved_names():
+        return None, f"{name!r} is a reserved house-bot name", 400
+    owner = _owner_hash()
+    with db.connect() as conn:
+        if not app.testing and db.count_bots_by_owner_since(conn, owner, time.time() - 86400) >= MAX_REGISTRATIONS_PER_OWNER_PER_DAY:
+            return None, "too many bots registered from here today -- try again tomorrow", 429
+        if db.get_bot_by_name(conn, name) is not None:
+            return None, f"the name {name!r} is taken", 409
+        # The server sets the starting balance. It used to take it from the
+        # request, so any bot could register with a billion chips.
+        bot = db.create_bot(conn, name, DEFAULT_STARTING_BALANCE, owner_hash=owner)
+    return bot, None, 201
+
+
 @app.route("/bots", methods=["POST"])
 def register_bot():
     body = request.get_json(silent=True) or {}
-    name = (body.get("name") or "").strip()
-    if not name:
-        return jsonify(error="name is required"), 400
-    if name in _all_reserved_names():
-        return jsonify(error=f"{name!r} is a reserved baseline-bot name"), 400
-    # The server sets the starting balance. It used to take it from the
-    # request, so any bot could register with a billion chips.
-    with db.connect() as conn:
-        try:
-            bot = db.create_bot(conn, name, DEFAULT_STARTING_BALANCE)
-        except Exception as exc:  # unique constraint, etc.
-            return jsonify(error=f"could not register bot: {exc}"), 400
-    return jsonify(bot), 201
+    bot, error, status = register_bot_record(body.get("name"))
+    if error:
+        return jsonify(error=error), status
+    return jsonify({**bot, "note": "Save api_key now -- it is shown only once."}), status
 
 
 @app.route("/leaderboard", methods=["GET"])
@@ -256,7 +304,19 @@ def _new_live_match(
         "hand": None,
         "hand_number": 0,
         "done": False,
+        # Provably fair dealing: the bot may pass its own client_seed; each hand
+        # gets a fresh server seed, committed (hashed) before the hand and
+        # revealed after it. See engine/cards.py deck_from_seeds.
+        "client_seed": secrets.token_hex(8),
+        "hand_seed": None,
+        "last_result": None,
+        "turn_started": _now(),
+        "timeouts": {"creator": 0, "opponent": 0},
+        "forfeited_by": None,
     }
+
+
+_LIVE_EXTRAS = ("client_seed", "hand_seed", "last_result", "turn_started", "timeouts", "forfeited_by")
 
 
 def _serialize_live(live: dict) -> dict:
@@ -273,6 +333,7 @@ def _serialize_live(live: dict) -> dict:
         "hand_number": live["hand_number"],
         "done": live["done"],
         "hand": live["hand"].to_dict() if live["hand"] is not None else None,
+        **{k: live[k] for k in _LIVE_EXTRAS},
     }
 
 
@@ -292,6 +353,9 @@ def _deserialize_live(match_id: int, data: dict) -> dict:
     live["hand_number"] = data["hand_number"]
     live["done"] = data["done"]
     live["hand"] = LeducHand.from_dict(data["hand"]) if data["hand"] is not None else None
+    for k in _LIVE_EXTRAS:
+        if k in data:
+            live[k] = data[k]
     return live
 
 
@@ -324,20 +388,124 @@ def _finish_match(live: dict) -> None:
         db.finish_match(conn, live["match_id"])
         db.delete_live_match(conn, live["match_id"])
         _maybe_resolve_boss_challenge(conn, live["match_id"], live["creator_bot_id"])
+        if live.get("forfeited_by"):
+            db.set_forfeit(conn, live["match_id"], live[f"{live['forfeited_by']}_bot_id"])
+        _rate_match(conn, live, "poker", live["hands_played"])
     LIVE_MATCHES.pop(live["match_id"], None)
 
 
 def _get_live(match_id: int) -> dict | None:
     live = LIVE_MATCHES.get(match_id)
-    if live is not None:
-        return live
-    with db.connect() as conn:
-        data = db.load_live_match(conn, match_id, game_type="leduc")
-    if data is None:
-        return None
-    live = _deserialize_live(match_id, data)
-    LIVE_MATCHES[match_id] = live
+    if live is None:
+        with db.connect() as conn:
+            data = db.load_live_match(conn, match_id, game_type="leduc")
+        if data is None:
+            return None
+        live = _deserialize_live(match_id, data)
+        LIVE_MATCHES[match_id] = live
+    _enforce_clock_poker(live)
     return live
+
+
+# --------------------------------------------------------------------------
+# Turn clock, forfeits and ratings (shared by both games)
+# --------------------------------------------------------------------------
+
+# House bots have fixed ratings, so they anchor the scale: an agent that plays
+# only the computer still gets a meaningful rating.
+HOUSE_RATINGS = {
+    "random_bot": 800, "heuristic_bot": 1200, "cfr_bot": 1600,
+    "random_duel_bot": 800, "heuristic_duel_bot": 1200, "boss_duel_bot": 1600,
+}
+# A match only moves ratings if it is long enough for skill to show.
+MIN_RATED_LENGTH = {"poker": 10, "duel": 3}
+# Two bots that aren't house bots can only move each other's ratings this many
+# times a day -- the same anti-farming idea as agenttrust.
+MAX_RATED_PAIR_GAMES_PER_DAY = 3
+
+
+def _rate_match(conn, live: dict, game: str, length_played: int) -> None:
+    """Updates Elo ratings once a match is over. Unrated when too short, when
+    both bots have the same owner, or past the daily pair cap."""
+    creator = db.get_bot(conn, live["creator_bot_id"])
+    opponent = db.get_bot(conn, live["opponent_bot_id"])
+    if creator is None or opponent is None:
+        return
+    forfeit = live.get("forfeited_by")
+    if forfeit is None and length_played < MIN_RATED_LENGTH[game]:
+        return
+    if forfeit == "creator":
+        score = 0.0
+    elif forfeit == "opponent":
+        score = 1.0
+    else:
+        net = 0
+        for row in db.match_history(conn, live["match_id"]):
+            net += row["payoff_seat0"] if row["seat0_bot_id"] == creator["id"] else row["payoff_seat1"]
+        score = 1.0 if net > 0 else 0.0 if net < 0 else 0.5
+    house_c, house_o = creator["name"] in HOUSE_RATINGS, opponent["name"] in HOUSE_RATINGS
+    if house_c and house_o:
+        return
+    if not house_c and not house_o:
+        if creator["owner_hash"] and creator["owner_hash"] == opponent["owner_hash"]:
+            return
+        if not db.take_rated_pair_slot(conn, creator["id"], opponent["id"], MAX_RATED_PAIR_GAMES_PER_DAY):
+            return
+    db.apply_elo(conn, game, creator["id"], opponent["id"], score,
+                 fixed_a=HOUSE_RATINGS.get(creator["name"]), fixed_b=HOUSE_RATINGS.get(opponent["name"]))
+
+
+def _side_to_move_poker(live: dict) -> str | None:
+    hand = live["hand"]
+    if live["done"] or hand is None or hand.done:
+        return None
+    return _seats_for_hand(live)[hand.to_act]
+
+
+def _enforce_clock_poker(live: dict) -> None:
+    """If a (non-house) bot has sat on its turn past TURN_SECONDS, moves for
+    it: check if it can, otherwise fold. MAX_TIMEOUTS forfeits the match."""
+    for _ in range(4):
+        side = _side_to_move_poker(live)
+        if side is None or _now() - live["turn_started"] <= TURN_SECONDS:
+            return
+        live["timeouts"][side] += 1
+        if live["timeouts"][side] >= MAX_TIMEOUTS:
+            live["forfeited_by"] = side
+            _finish_match(live)
+            return
+        hand = live["hand"]
+        hand.apply("check" if "check" in hand.legal_actions() else "fold")
+        _autoplay_baseline_turns(live)
+        live["turn_started"] = _now()
+        if hand.done:
+            _settle_hand_and_maybe_advance(live)
+        if not live["done"]:
+            _persist_live(live)
+
+
+def _enforce_clock_duel(live: dict) -> None:
+    fight = live["fight"]
+    if live["done"] or fight is None or fight.done or _now() - live["turn_started"] <= TURN_SECONDS:
+        return
+    seats = _seats_for_fight(live)
+    for seat in (0, 1):
+        if seat in fight.pending_moves or fight.done:
+            continue
+        side = seats[seat]
+        live["timeouts"][side] += 1
+        if live["timeouts"][side] >= MAX_TIMEOUTS:
+            live["forfeited_by"] = side
+            _finish_duel_match(live)
+            return
+        fight.submit(seat, "rest")
+    live["turn_started"] = _now()
+    if fight.done:
+        _settle_fight_and_maybe_advance(live)
+    else:
+        _autoplay_baseline_duel_moves(live)
+    if not live["done"]:
+        _persist_live_duel(live)
 
 
 # --------------------------------------------------------------------------
@@ -382,8 +550,10 @@ def _start_next_hand(live: dict) -> None:
         return
 
     hand = LeducHand(rng=_rng, rake_bps=live["rake_bps"], stacks=stacks)
-    hand.start()
+    live["hand_seed"] = secrets.token_hex(16)
+    hand.start(deck=deck_from_seeds(live["hand_seed"], live["client_seed"]))
     live["hand"] = hand
+    live["turn_started"] = _now()
     _autoplay_baseline_turns(live)
 
 
@@ -422,6 +592,23 @@ def _settle_hand_and_maybe_advance(live: dict) -> None:
             currency=live["currency"], unit_value_cents=live["unit_value_cents"],
         )
 
+    # What the bots get told about the hand that just ended. Cards are only
+    # shown if it went to showdown (a folded hand stays secret, as in real
+    # poker); the server seed is always revealed so the deal can be checked.
+    creator_seat = 0 if seats[0] == "creator" else 1
+    live["last_result"] = {
+        "hand_number": live["hand_number"],
+        "payoff": {"creator": result.payoffs[creator_seat], "opponent": result.payoffs[1 - creator_seat]},
+        "showdown": result.went_to_showdown,
+        "cards": (
+            {"creator": str(result.hole_cards[creator_seat]), "opponent": str(result.hole_cards[1 - creator_seat]),
+             "board": str(result.board_card)}
+            if result.went_to_showdown else None
+        ),
+        "actions": list(hand.action_history),
+        "server_seed": live["hand_seed"],
+        "client_seed": live["client_seed"],
+    }
     live["hands_played"] += 1
     if live["hands_played"] >= live["hands_requested"]:
         _finish_match(live)
@@ -528,6 +715,7 @@ def match_action(match_id: int):
             return jsonify(error=str(exc), legal_actions=hand.legal_actions()), 400
 
         _autoplay_baseline_turns(live)
+        live["turn_started"] = _now()
 
         if hand.done:
             _settle_hand_and_maybe_advance(live)
@@ -700,7 +888,14 @@ def _new_live_duel_match(
         "fight": None,
         "fight_number": 0,
         "done": False,
+        "last_result": None,
+        "turn_started": _now(),
+        "timeouts": {"creator": 0, "opponent": 0},
+        "forfeited_by": None,
     }
+
+
+_DUEL_EXTRAS = ("last_result", "turn_started", "timeouts", "forfeited_by")
 
 
 def _serialize_live_duel(live: dict) -> dict:
@@ -718,6 +913,7 @@ def _serialize_live_duel(live: dict) -> dict:
         "fight_number": live["fight_number"],
         "done": live["done"],
         "fight": live["fight"].to_dict() if live["fight"] is not None else None,
+        **{k: live[k] for k in _DUEL_EXTRAS},
     }
 
 
@@ -738,6 +934,9 @@ def _deserialize_live_duel(match_id: int, data: dict) -> dict:
     live["fight_number"] = data["fight_number"]
     live["done"] = data["done"]
     live["fight"] = DuelFight.from_dict(data["fight"], rng=_rng) if data["fight"] is not None else None
+    for k in _DUEL_EXTRAS:
+        if k in data:
+            live[k] = data[k]
     return live
 
 
@@ -752,19 +951,22 @@ def _finish_duel_match(live: dict) -> None:
         db.finish_match(conn, live["match_id"])
         db.delete_live_match(conn, live["match_id"])
         _maybe_resolve_boss_challenge(conn, live["match_id"], live["creator_bot_id"])
+        if live.get("forfeited_by"):
+            db.set_forfeit(conn, live["match_id"], live[f"{live['forfeited_by']}_bot_id"])
+        _rate_match(conn, live, "duel", live["fights_played"])
     LIVE_DUEL_MATCHES.pop(live["match_id"], None)
 
 
 def _get_live_duel(match_id: int) -> dict | None:
     live = LIVE_DUEL_MATCHES.get(match_id)
-    if live is not None:
-        return live
-    with db.connect() as conn:
-        data = db.load_live_match(conn, match_id, game_type="duel")
-    if data is None:
-        return None
-    live = _deserialize_live_duel(match_id, data)
-    LIVE_DUEL_MATCHES[match_id] = live
+    if live is None:
+        with db.connect() as conn:
+            data = db.load_live_match(conn, match_id, game_type="duel")
+        if data is None:
+            return None
+        live = _deserialize_live_duel(match_id, data)
+        LIVE_DUEL_MATCHES[match_id] = live
+    _enforce_clock_duel(live)
     return live
 
 
@@ -800,6 +1002,7 @@ def _start_next_fight(live: dict) -> None:
     fight = DuelFight(rng=_rng, rake_bps=live["rake_bps"], stake=live["stake"], stacks=stacks)
     fight.start()
     live["fight"] = fight
+    live["turn_started"] = _now()
     _autoplay_baseline_duel_moves(live)
 
 
@@ -837,6 +1040,15 @@ def _settle_fight_and_maybe_advance(live: dict) -> None:
             currency=live["currency"], unit_value_cents=live["unit_value_cents"],
         )
 
+    creator_seat = 0 if seats[0] == "creator" else 1
+    live["last_result"] = {
+        "fight_number": live["fight_number"],
+        "payoff": {"creator": result.payoffs[creator_seat], "opponent": result.payoffs[1 - creator_seat]},
+        "knockout": result.ko,
+        "rounds_played": result.rounds_played,
+        "final_hp": {"creator": result.final_hp[creator_seat] if isinstance(result.final_hp, dict) else None,
+                     "opponent": result.final_hp[1 - creator_seat] if isinstance(result.final_hp, dict) else None},
+    }
     live["fights_played"] += 1
     if live["fights_played"] >= live["fights_requested"]:
         _finish_duel_match(live)
@@ -941,6 +1153,8 @@ def duel_match_action(match_id: int):
             return jsonify(error=str(exc), legal_actions=fight.legal_actions(seat)), 400
 
         _autoplay_baseline_duel_moves(live)
+        if seat not in fight.pending_moves:
+            live["turn_started"] = _now()  # the round resolved; a new one starts
 
         if fight.done:
             _settle_fight_and_maybe_advance(live)
@@ -1327,6 +1541,10 @@ def negotiation_exam_public(exam_id: int):
         critical_failures=len(report["critical_failures"]),
         summary=report["summary"],
     )
+
+
+# The easy play layer (/play, /mcp, agent docs) lives in its own module.
+from api import play  # noqa: E402,F401
 
 
 def create_app():
