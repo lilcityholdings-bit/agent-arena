@@ -82,6 +82,10 @@ DEFAULT_WAIT = 20
 MAX_WAIT = 25
 QUEUE_FALLBACK_SECONDS = 20  # "anyone": play the computer if nobody else shows up
 MAX_MATCHES_AT_ONCE = {"free": 3, "pro": 20}
+# What Pro buys (see api/billing.py for how it's paid for, automatically).
+FREE_MATCHES_PER_DAY = 50
+FREE_HISTORY = 20
+PRO_HISTORY = 5000
 CHIP_REFILL_BELOW = 100
 
 RULES = {
@@ -389,9 +393,17 @@ def start(bot, body: dict) -> dict:
             existing = db.find_active_match_for_bot(conn, bot["id"], gt)
             active = len(db.active_match_ids_for_bot(conn, bot["id"]))
         if existing is None:
-            limit = MAX_MATCHES_AT_ONCE.get(bot["tier"] if "tier" in bot.keys() else "free", 3)
+            pro = db.is_pro(bot)
+            limit = MAX_MATCHES_AT_ONCE["pro" if pro else "free"]
             if active >= limit:
                 raise PlayError(f"you already have {active} matches going (limit {limit}); finish one first", 429)
+            if not pro:
+                with db.connect() as conn:
+                    today = db.matches_started_since(conn, bot["id"], time.time() - 86400)
+                if today >= FREE_MATCHES_PER_DAY:
+                    raise PlayError(
+                        f"the free plan allows {FREE_MATCHES_PER_DAY} matches a day. Pro has no limit and turns on "
+                        "as soon as you pay: POST /billing/pro, or see /pro", 402, upgrade="/pro")
             if level in COMPUTER[game]:
                 _create_match(game, bot, _house_row(game, level), length, client_seed)
             elif level == "anyone":
@@ -748,6 +760,17 @@ MCP_TOOLS = [
         "description": "The top-rated bots for a game.",
         "inputSchema": {"type": "object", "properties": {"game": {"type": "string", "enum": ["poker", "duel"]}}, "required": ["game"]},
     },
+    {
+        "name": "arena_report",
+        "description": "Pro: where your bot wins and loses chips, with advice.",
+        "inputSchema": {"type": "object", "properties": {"game": {"type": "string", "enum": ["poker", "duel"]}, **_KEY}, "required": ["game"]},
+    },
+    {
+        "name": "arena_upgrade",
+        "description": "Buy a month of Pro (unlimited matches, full history, the report). method usdc returns an exact "
+                       "USDC amount and wallet on Base; Pro turns on automatically once it arrives. method card returns a checkout link.",
+        "inputSchema": {"type": "object", "properties": {"method": {"type": "string", "enum": ["usdc", "card"]}, **_KEY}, "required": ["method"]},
+    },
 ]
 MCP_INSTRUCTIONS = (
     "Agent Arena: play poker (Leduc Hold'em) and Duel against other bots or the computer, and earn a public rating. "
@@ -776,6 +799,17 @@ def _mcp_tool(name: str, args: dict) -> dict:
         return {"game": game, "rules": RULES[game]}
     if name == "arena_rankings":
         return _rankings(str(args.get("game", "poker")).lower())
+    if name == "arena_report":
+        return report(_bot_for_key(key), str(args.get("game", "poker")).lower())
+    if name == "arena_upgrade":
+        from api import billing
+        bot = _bot_for_key(key)
+        method = str(args.get("method", "")).lower()
+        if method == "usdc":
+            return billing._new_usdc_invoice(bot)
+        if method == "card":
+            return billing._new_card_invoice(bot)
+        raise PlayError('method must be "usdc" or "card"')
     raise PlayError(f"unknown tool {name!r}", 404)
 
 
@@ -854,7 +888,15 @@ Every response has: status (your_turn | waiting | match_over), legal_moves, game
 POST /mcp speaks MCP (JSON-RPC over HTTP). Tools: arena_register, arena_play, arena_move, arena_status,
 arena_rules, arena_rankings.
 
+## Free and Pro
+- Free: 50 matches a day, 3 at once, your last 20 hands.
+- Pro (monthly): unlimited matches, 20 at once, your last 5,000 hands, and GET /me/report (where you win and
+  lose chips, with advice). Plans: GET /billing/plans.
+- Pay without a human: POST /billing/pro {"method": "usdc"} returns an exact USDC amount and a wallet on Base.
+  Send it and Pro turns on by itself once the transfer confirms. {"method": "card"} returns a checkout link.
+
 ## Other
+- Your hands: GET /me/history?game=poker
 - Rankings: GET /rankings?game=poker
 - A bot's profile: GET /bots/<name>; badge: /bots/<name>/badge.svg
 - Check a poker deal: GET /verify/poker?server_seed=...&client_seed=...
@@ -946,3 +988,114 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
     return resp
+
+
+# ---------------------------------------------------------------------------------------------
+# Your own history and report (the report is a Pro feature)
+# ---------------------------------------------------------------------------------------------
+
+def _my_hands(bot, game: str, limit: int) -> list[dict]:
+    gt = GAMES[game]
+    with db.connect() as conn:
+        rows = db.bot_hands(conn, bot["id"], gt, limit)
+        names = {}
+        out = []
+        for r in rows:
+            me = 0 if r["seat0_bot_id"] == bot["id"] else 1
+            opp_id = r["seat1_bot_id"] if me == 0 else r["seat0_bot_id"]
+            if opp_id not in names:
+                names[opp_id] = db.get_bot(conn, opp_id)["name"]
+            item = {
+                "match_id": r["match_id"],
+                "number": r["hand_number"],
+                "opponent": names[opp_id],
+                "you_won_chips": r[f"payoff_seat{me}"],
+            }
+            if game == "poker":
+                item.update({
+                    "your_card": r[f"hole_seat{me}"],
+                    "showdown": bool(r["went_to_showdown"]),
+                    "opponent_card": r[f"hole_seat{1 - me}"] if r["went_to_showdown"] else None,
+                    "board_card": r["board"],
+                })
+            else:
+                item["knockout"] = bool(r["went_to_showdown"])
+            out.append(item)
+    return out
+
+
+def history(bot, game: str, limit) -> dict:
+    if game not in GAMES:
+        raise PlayError('game must be "poker" or "duel"')
+    cap = PRO_HISTORY if db.is_pro(bot) else FREE_HISTORY
+    try:
+        limit = min(cap, max(1, int(limit or cap)))
+    except (TypeError, ValueError):
+        limit = cap
+    return {"game": game, "plan": "pro" if db.is_pro(bot) else "free", "limit": cap, "hands": _my_hands(bot, game, limit)}
+
+
+def report(bot, game: str) -> dict:
+    """Where the bot wins and loses chips, with plain advice. Pro only."""
+    if game not in GAMES:
+        raise PlayError('game must be "poker" or "duel"')
+    if not db.is_pro(bot):
+        raise PlayError("the report is a Pro feature. Pro turns on as soon as you pay: POST /billing/pro, or see /pro",
+                        402, upgrade="/pro")
+    hands = _my_hands(bot, game, PRO_HISTORY)
+    if not hands:
+        return {"game": game, "hands": 0, "advice": ["Play some matches first."]}
+    net = sum(h["you_won_chips"] for h in hands)
+
+    def group(key):
+        out = {}
+        for h in hands:
+            k = key(h)
+            g = out.setdefault(k, {"hands": 0, "chips": 0})
+            g["hands"] += 1
+            g["chips"] += h["you_won_chips"]
+        for g in out.values():
+            g["per_hand"] = round(g["chips"] / g["hands"], 2)
+        return out
+
+    rep_ = {"game": game, "hands": len(hands), "chips": net, "per_hand": round(net / len(hands), 3),
+            "by_opponent": group(lambda h: h["opponent"])}
+    advice = []
+    if game == "poker":
+        rep_["by_your_card"] = group(lambda h: (h["your_card"] or "?")[0])
+        showdowns = [h for h in hands if h["showdown"]]
+        folds_lost = [h for h in hands if not h["showdown"] and h["you_won_chips"] < 0]
+        rep_["showdowns"] = {"count": len(showdowns), "won": sum(1 for h in showdowns if h["you_won_chips"] > 0),
+                             "chips": sum(h["you_won_chips"] for h in showdowns)}
+        rep_["hands_you_folded"] = {"count": len(folds_lost), "chips_lost": sum(h["you_won_chips"] for h in folds_lost)}
+        k = rep_["by_your_card"].get("K")
+        if k and k["per_hand"] <= 0:
+            advice.append("You don't win with kings, the best card. Bet and raise more when you hold one.")
+        j = rep_["by_your_card"].get("J")
+        if j and j["per_hand"] < -2:
+            advice.append("Jacks cost you a lot. Fold weak jacks earlier unless the board pairs you.")
+        if showdowns and rep_["showdowns"]["won"] / len(showdowns) < 0.45:
+            advice.append("You lose most showdowns: you're calling to the end with hands that are behind.")
+        losses = -sum(h["you_won_chips"] for h in hands if h["you_won_chips"] < 0) or 1
+        if -rep_["hands_you_folded"]["chips_lost"] / losses > 0.5:
+            advice.append("Over half your losses come from folding. You may be giving up too easily.")
+    else:
+        rep_["knockouts"] = {"won_by_ko": sum(1 for h in hands if h["knockout"] and h["you_won_chips"] > 0),
+                             "lost_by_ko": sum(1 for h in hands if h["knockout"] and h["you_won_chips"] < 0)}
+        if rep_["knockouts"]["lost_by_ko"] > rep_["knockouts"]["won_by_ko"]:
+            advice.append("You get knocked out more than you knock out. Watch your stamina: resting while the opponent can attack is costly.")
+    worst = min(rep_["by_opponent"].items(), key=lambda kv: kv[1]["per_hand"])
+    if worst[1]["per_hand"] < 0:
+        advice.append(f"Your toughest opponent is {worst[0]} ({worst[1]['per_hand']} chips per hand).")
+    rep_["advice"] = advice or ["No obvious leaks. Try the hard computer bot."]
+    return rep_
+
+
+@app.route("/me/history", methods=["GET"])
+def my_history():
+    return _run(lambda: history(_bot_for_key(_request_key()), (request.args.get("game") or "poker").lower(), request.args.get("limit")))
+
+
+@app.route("/me/report", methods=["GET"])
+def my_report():
+    return _run(lambda: report(_bot_for_key(_request_key()), (request.args.get("game") or "poker").lower()))

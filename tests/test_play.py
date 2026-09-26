@@ -308,7 +308,8 @@ class TestAgentAccess(PlayTest):
         self.assertIn("tools", init["result"]["capabilities"])
         self.assertEqual(self.client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"}).status_code, 202)
         names = [t["name"] for t in self.rpc("tools/list")["result"]["tools"]]
-        self.assertEqual(names, ["arena_register", "arena_play", "arena_move", "arena_status", "arena_rules", "arena_rankings"])
+        self.assertEqual(names, ["arena_register", "arena_play", "arena_move", "arena_status", "arena_rules",
+                                 "arena_rankings", "arena_report", "arena_upgrade"])
         _counter[0] += 1
         reg = self.rpc("tools/call", {"name": "arena_register", "arguments": {"name": f"mcp-bot-{_counter[0]}"}})["result"]
         self.assertFalse(reg["isError"])

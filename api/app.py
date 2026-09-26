@@ -1550,12 +1550,15 @@ def negotiation_exam_public(exam_id: int):
     )
 
 
-# The easy play layer (/play, /mcp, agent docs) lives in its own module.
+# The easy play layer (/play, /mcp, agent docs) and automated billing live in
+# their own modules.
 from api import play  # noqa: E402,F401
+from api import billing  # noqa: E402
 
 
 def create_app():
     db.init_db()
+    billing.start_watcher()
     with db.connect() as conn:
         _ensure_baseline_bots(conn, BASELINE_BOT_FACTORIES)
         _ensure_baseline_bots(conn, DUEL_BASELINE_BOT_FACTORIES)

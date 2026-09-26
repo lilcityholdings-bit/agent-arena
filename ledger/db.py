@@ -222,6 +222,37 @@ CREATE TABLE IF NOT EXISTS rated_pairs (
     PRIMARY KEY (day, low_id, high_id)
 );
 
+-- Automated billing (api/billing.py). An invoice is paid either in USDC on
+-- Base (matched on-chain by its exact, unique amount) or by card through
+-- Stripe (confirmed by Stripe's signed webhook). Paying extends the bot's
+-- bots.pro_until; nothing is ever switched on or off by hand.
+CREATE TABLE IF NOT EXISTS invoices (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_id INTEGER NOT NULL REFERENCES bots(id),
+    method TEXT NOT NULL,             -- 'usdc' or 'card'
+    product TEXT NOT NULL,            -- 'pro_month'
+    amount_units INTEGER NOT NULL,    -- USDC has 6 decimals; cards use cents
+    status TEXT NOT NULL,             -- 'pending', 'paid', 'expired'
+    created_at REAL NOT NULL,
+    expires_at REAL NOT NULL,
+    start_block INTEGER,              -- usdc: only transfers after this block count
+    tx_ref TEXT UNIQUE,               -- usdc tx hash + log index, or Stripe invoice id
+    paid_at REAL
+);
+
+-- Small key/value settings the server manages itself (e.g. the Stripe webhook
+-- secret it got when it registered its own webhook).
+CREATE TABLE IF NOT EXISTS settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+
+-- Stripe event ids already handled, so a retried webhook never pays twice.
+CREATE TABLE IF NOT EXISTS stripe_events (
+    id TEXT PRIMARY KEY,
+    received_at REAL NOT NULL
+);
+
 -- The /play queue (api/play.py). target_bot_id NULL means "anyone"; set, it
 -- means "only this bot", and the two are matched only when both have named
 -- each other, so no bot can be dragged into a match it didn't agree to.
@@ -296,6 +327,7 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
         # "free" or "pro" -- pro raises the limits in api/play.py.
         _ensure_column(conn, "bots", "tier", "TEXT NOT NULL DEFAULT 'free'")
         _ensure_column(conn, "matches", "forfeited_by_bot_id", "INTEGER")
+        _ensure_column(conn, "bots", "pro_until", "REAL")
         # Databases from before keys were hashed: hash any key still stored raw
         # (raw keys are 32 hex characters; hashes are 64).
         for row in conn.execute("SELECT id, api_key FROM bots WHERE length(api_key) != 64").fetchall():
@@ -858,3 +890,89 @@ def queue_invitations(conn, bot_id: int) -> list[sqlite3.Row]:
            WHERE q.target_bot_id = ? ORDER BY q.joined_at""",
         (bot_id,),
     ).fetchall()
+
+
+# ---- billing ------------------------------------------------------------------------------
+
+def is_pro(bot: sqlite3.Row) -> bool:
+    keys = bot.keys()
+    if "tier" in keys and bot["tier"] == "pro":
+        return True
+    return "pro_until" in keys and bot["pro_until"] is not None and bot["pro_until"] > time.time()
+
+
+def extend_pro(conn, bot_id: int, seconds: float, until: float | None = None) -> float:
+    """Adds `seconds` to the bot's Pro time (from now, or from its current end
+    if it's still Pro), or sets it to `until` if that's later. Returns the new end."""
+    row = conn.execute("SELECT pro_until FROM bots WHERE id = ?", (bot_id,)).fetchone()
+    current = row["pro_until"] if row and row["pro_until"] and row["pro_until"] > time.time() else time.time()
+    new_end = max(current + seconds, until or 0)
+    conn.execute("UPDATE bots SET pro_until = ? WHERE id = ?", (new_end, bot_id))
+    return new_end
+
+
+def create_invoice(conn, bot_id: int, method: str, product: str, amount_units: int, ttl: float, start_block: int | None) -> int:
+    now = time.time()
+    return conn.execute(
+        """INSERT INTO invoices (bot_id, method, product, amount_units, status, created_at, expires_at, start_block)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)""",
+        (bot_id, method, product, amount_units, now, now + ttl, start_block),
+    ).lastrowid
+
+
+def get_invoice(conn, invoice_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM invoices WHERE id = ?", (invoice_id,)).fetchone()
+
+
+def pending_usdc_amount_taken(conn, amount_units: int) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM invoices WHERE method = 'usdc' AND status = 'pending' AND amount_units = ? AND expires_at > ?",
+        (amount_units, time.time()),
+    ).fetchone() is not None
+
+
+def pending_usdc_invoices(conn) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM invoices WHERE method = 'usdc' AND status = 'pending'").fetchall()
+
+
+def mark_invoice(conn, invoice_id: int, status: str, tx_ref: str | None = None) -> None:
+    conn.execute(
+        "UPDATE invoices SET status = ?, tx_ref = COALESCE(?, tx_ref), paid_at = CASE WHEN ? = 'paid' THEN ? ELSE paid_at END WHERE id = ?",
+        (status, tx_ref, status, time.time(), invoice_id),
+    )
+
+
+def tx_ref_used(conn, tx_ref: str) -> bool:
+    return conn.execute("SELECT 1 FROM invoices WHERE tx_ref = ?", (tx_ref,)).fetchone() is not None
+
+
+def record_stripe_event(conn, event_id: str) -> bool:
+    """False if this event was already handled."""
+    try:
+        conn.execute("INSERT INTO stripe_events (id, received_at) VALUES (?, ?)", (event_id, time.time()))
+        return True
+    except sqlite3.IntegrityError:
+        return False
+
+
+def matches_started_since(conn, bot_id: int, since: float) -> int:
+    return conn.execute(
+        "SELECT COUNT(*) FROM matches WHERE (bot_a_id = ? OR bot_b_id = ?) AND started_at >= ?", (bot_id, bot_id, since)
+    ).fetchone()[0]
+
+
+def bot_hands(conn, bot_id: int, game_type: str, limit: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """SELECT * FROM hands WHERE (seat0_bot_id = ? OR seat1_bot_id = ?) AND game_type = ?
+           ORDER BY id DESC LIMIT ?""",
+        (bot_id, bot_id, game_type, limit),
+    ).fetchall()
+
+
+def get_setting(conn, key: str) -> str | None:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_setting(conn, key: str, value: str) -> None:
+    conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
