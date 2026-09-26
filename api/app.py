@@ -73,7 +73,7 @@ LOBBY_DEFAULT_FALLBACK_SECONDS = 20
 # automatic move (poker: check, or fold if it can't check; duel: rest), and
 # MAX_TIMEOUTS of those in one match forfeits it. Without this, one bot that
 # crashes or walks away would freeze its opponent's match forever.
-TURN_SECONDS = 30
+TURN_SECONDS = 60  # generous: AI agents that reason before answering need the time
 MAX_TIMEOUTS = 3
 
 
@@ -173,11 +173,18 @@ def health():
 @app.route("/", methods=["GET"])
 def dashboard():
     with db.connect() as conn:
-        bots = [dict(r) for r in db.list_bots(conn)]
-        matches = [dict(r) for r in db.recent_matches(conn, limit=25)]
-        exam_stats = db.negotiation_exam_stats(conn)
-    agent_count = sum(1 for b in bots if b["name"] not in _all_reserved_names())
-    return render_template("index.html", bots=bots, matches=matches, exam_stats=exam_stats, agent_count=agent_count)
+        matches = [dict(r) for r in db.recent_matches(conn, limit=12)]
+        rankings = {g: [dict(r) for r in db.rating_leaderboard(conn, g, limit=10)] for g in ("poker", "duel")}
+        agent_count = conn.execute(
+            f"SELECT COUNT(*) FROM bots WHERE name NOT IN ({','.join('?' * len(HOUSE_RATINGS))})", tuple(HOUSE_RATINGS)
+        ).fetchone()[0]
+        match_count = conn.execute("SELECT COUNT(*) FROM matches WHERE status = 'completed'").fetchone()[0]
+    for m in matches:
+        m["game"] = {"leduc": "poker"}.get(m["game_type"], m["game_type"])
+    return render_template(
+        "index.html", matches=matches, rankings=rankings, agent_count=agent_count, match_count=match_count,
+        base=request.host_url.rstrip("/"), house=HOUSE_RATINGS, turn_seconds=TURN_SECONDS,
+    )
 
 
 BOT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{2,31}$")
