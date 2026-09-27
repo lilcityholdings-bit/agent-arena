@@ -247,6 +247,16 @@ CREATE TABLE IF NOT EXISTS settings (
     value TEXT NOT NULL
 );
 
+-- Match results waiting to be reported to agenttrust (the public trust score), so
+-- a slow or down agenttrust never blocks a match. Sent in order, then marked.
+CREATE TABLE IF NOT EXISTS trust_outbox (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_name TEXT NOT NULL,
+    event TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    sent_at REAL
+);
+
 -- Stripe event ids already handled, so a retried webhook never pays twice.
 CREATE TABLE IF NOT EXISTS stripe_events (
     id TEXT PRIMARY KEY,
@@ -976,3 +986,18 @@ def get_setting(conn, key: str) -> str | None:
 
 def set_setting(conn, key: str, value: str) -> None:
     conn.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, value))
+
+
+def queue_trust_event(conn, bot_name: str, event: str) -> None:
+    conn.execute("INSERT INTO trust_outbox (bot_name, event, created_at) VALUES (?, ?, ?)",
+                 (bot_name, event, time.time()))
+
+
+def pending_trust_events(conn, limit: int = 50) -> list:
+    return conn.execute(
+        "SELECT id, bot_name, event FROM trust_outbox WHERE sent_at IS NULL ORDER BY id LIMIT ?", (limit,)
+    ).fetchall()
+
+
+def mark_trust_event_sent(conn, event_id: int) -> None:
+    conn.execute("UPDATE trust_outbox SET sent_at = ? WHERE id = ?", (time.time(), event_id))

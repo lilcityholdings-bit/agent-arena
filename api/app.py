@@ -460,6 +460,10 @@ def _rate_match(conn, live: dict, game: str, length_played: int) -> None:
             return
     db.apply_elo(conn, game, creator["id"], opponent["id"], score,
                  fixed_a=HOUSE_RATINGS.get(creator["name"]), fixed_b=HOUSE_RATINGS.get(opponent["name"]))
+    # A rated match is a real record: report it to agenttrust (see api/trust.py).
+    for side, bot, house in (("creator", creator, house_c), ("opponent", opponent, house_o)):
+        if not house:
+            trust.queue_match_result(conn, bot["name"], forfeited=forfeit == side)
 
 
 def _side_to_move_poker(live: dict) -> str | None:
@@ -1554,11 +1558,13 @@ def negotiation_exam_public(exam_id: int):
 # their own modules.
 from api import play  # noqa: E402,F401
 from api import billing  # noqa: E402
+from api import trust  # noqa: E402
 
 
 def create_app():
     db.init_db()
     billing.start_watcher()
+    trust.start_reporter()
     with db.connect() as conn:
         _ensure_baseline_bots(conn, BASELINE_BOT_FACTORIES)
         _ensure_baseline_bots(conn, DUEL_BASELINE_BOT_FACTORIES)

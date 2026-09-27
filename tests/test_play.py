@@ -13,6 +13,7 @@ fd, _TEST_DB_PATH = tempfile.mkstemp(suffix=".db")
 os.close(fd)
 os.environ["ARENA_DB_PATH"] = _TEST_DB_PATH
 os.environ["ARENA_ADMIN_SECRET"] = "test-admin-secret"
+os.environ["ARENA_BACKGROUND"] = "0"
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -43,6 +44,12 @@ class PlayTest(unittest.TestCase):
         r = self.client.post("/bots", json={"name": f"{prefix}-{_counter[0]}"}, headers=headers)
         self.assertEqual(r.status_code, 201, r.get_json())
         return {"X-API-Key": r.get_json()["api_key"], "name": r.get_json()["name"]}
+
+    def trust_events(self, name):
+        from ledger import db
+        with db.connect() as conn:
+            rows = conn.execute("SELECT event FROM trust_outbox WHERE bot_name = ? ORDER BY id", (name,)).fetchall()
+        return [r["event"] for r in rows]
 
     def hdr(self, bot):
         return {"X-API-Key": bot["X-API-Key"]}
@@ -205,6 +212,8 @@ class TestClockAndRatings(PlayTest):
         sb = self.client.get(f"/play/{match_id}?wait=0", headers=self.hdr(b)).get_json()
         self.assertIn("forfeit", sb["result"])
         self.assertEqual(sa["result"], "you won (your opponent forfeited)")
+        self.assertEqual(self.trust_events(b["name"]), ["ghosted"], "going silent is reported to agenttrust")
+        self.assertEqual(self.trust_events(a["name"]), ["cleared_cleanly"])
 
     def test_ratings_anchor_to_the_house_and_winners_go_up(self):
         bot = self.register()
@@ -334,3 +343,58 @@ class TestAgentAccess(PlayTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAgentTrust(PlayTest):
+    def test_a_rated_match_is_queued_for_agenttrust_and_an_unrated_one_is_not(self):
+        bot = self.register()
+        self.play_out(bot, self.client.post("/play", json={"game": "poker", "opponent": "easy", "length": 10}, headers=self.hdr(bot)).get_json())
+        self.assertEqual(self.trust_events(bot["name"]), ["cleared_cleanly"])
+        short = self.register()
+        self.play_out(short, self.client.post("/play", json={"game": "poker", "opponent": "easy", "length": 3}, headers=self.hdr(short)).get_json())
+        self.assertEqual(self.trust_events(short["name"]), [], "too short to rate, so nothing to report")
+
+    def test_the_arena_proves_it_is_the_source_by_publishing_its_secret_hash(self):
+        from api import trust
+        from ledger import db
+        r = self.client.get("/.well-known/agenttrust-source.json").get_json()
+        with db.connect() as conn:
+            secret = db.get_setting(conn, "agenttrust_secret")
+        self.assertEqual(r, {"source": "arena", "secret_sha256": hashlib.sha256(secret.encode()).hexdigest()})
+        self.assertEqual(self.client.get("/.well-known/agenttrust-source.json").get_json(), r, "stable")
+        self.assertNotIn(secret, self.client.get("/llms.txt").get_data(as_text=True))
+        self.assertEqual(trust.subject_for("x"), "arena.x")
+
+    def test_reports_wait_until_agenttrust_trusts_the_arena_then_go_out_once(self):
+        from api import trust
+        from ledger import db
+        with db.connect() as conn:
+            conn.execute("UPDATE trust_outbox SET sent_at = 1")
+            db.queue_trust_event(conn, "flush-bot", "cleared_cleanly")
+        calls = []
+
+        def fake(trusted):
+            def http(method, url, body=None):
+                calls.append((method, url, body))
+                if url.endswith("/health"):
+                    return 200, {"trusted_sources": ["arena"] if trusted else []}
+                return 200, {"accepted": True}
+            return http
+
+        trust._trusted_checked_at = 0
+        with mock.patch("api.trust._http", side_effect=fake(False)):
+            self.assertEqual(trust.flush(), 0, "not trusted yet: hold everything")
+        trust._trusted_checked_at = 0
+        with mock.patch("api.trust._http", side_effect=fake(True)):
+            self.assertEqual(trust.flush(), 1)
+            self.assertEqual(trust.flush(), 0, "sent once")
+        posted = [c for c in calls if c[0] == "POST"]
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(posted[0][2]["subject"], "arena.flush-bot")
+        self.assertEqual(posted[0][2]["source"], "arena")
+
+    def test_profiles_link_the_trust_score(self):
+        bot = self.register()
+        p = self.client.get(f"/bots/{bot['name']}").get_json()
+        self.assertTrue(p["agenttrust"]["profile"].endswith(f"/trust/arena.{bot['name']}"))
+        self.assertIsNone(self.client.get("/bots/random_bot").get_json()["agenttrust"])

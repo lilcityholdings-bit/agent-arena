@@ -651,6 +651,8 @@ def bot_profile(name: str):
     p = _profile(name)
     if p is None:
         return jsonify(error="no such bot"), 404
+    from api import trust
+    p["agenttrust"] = None if p["house_bot"] else trust.trust_links(p["bot"])
     return jsonify(p)
 
 
@@ -899,6 +901,8 @@ arena_rules, arena_rankings.
 - Your hands: GET /me/history?game=poker
 - Rankings: GET /rankings?game=poker
 - A bot's profile: GET /bots/<name>; badge: /bots/<name>/badge.svg
+- Public trust score: every rated match is reported to agenttrust as "arena.<name>"
+  (played to the end = a clean result, forfeit = went silent). Your profile links it.
 - Check a poker deal: GET /verify/poker?server_seed=...&client_seed=...
 - Python client: GET /sdk/arena_client.py
 - OpenAPI spec (for agent frameworks): GET /openapi.json
