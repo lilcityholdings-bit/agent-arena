@@ -183,7 +183,7 @@ def check_usdc_invoice(inv) -> bool:
         "topics": [TRANSFER_TOPIC, None, "0x" + "0" * 24 + to[2:]],
     }])
     for log in logs:
-        if int(log["data"], 16) != inv["amount_units"]:
+        if log.get("removed") or int(log["data"], 16) != inv["amount_units"]:
             continue
         ref = f"{log['transactionHash'].lower()}:{int(log['logIndex'], 16)}"
         with db.connect() as conn:

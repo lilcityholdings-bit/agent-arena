@@ -14,6 +14,7 @@ Auth: pass your api_key either as header `X-API-Key` or in the JSON body.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import os
 import random
 import re
@@ -192,10 +193,19 @@ MAX_REGISTRATIONS_PER_OWNER_PER_DAY = int(os.environ.get("ARENA_MAX_REGISTRATION
 
 
 def _client_ip() -> str:
-    """The caller's address. Behind Railway's proxy the real one is the first
-    entry of X-Forwarded-For; run directly, it's the socket's address."""
-    forwarded = request.headers.get("X-Forwarded-For", "")
-    return forwarded.split(",")[0].strip() or request.headers.get("X-Real-IP") or request.remote_addr or "unknown"
+    """The caller's address. Behind Railway's edge that is X-Real-IP, which the
+    edge sets itself; run directly, it's the socket's address.
+
+    Never X-Forwarded-For: its first entry is whatever the caller wrote, so
+    trusting it let anyone dodge the rate limit, the daily sign-up cap and the
+    "an owner's own bots can't rate each other" rule just by changing a header."""
+    return (request.headers.get("X-Real-IP") or "").strip() or request.remote_addr or "unknown"
+
+
+def is_admin_secret(provided: str | None) -> bool:
+    """Constant-time check of an admin secret; always False when none is configured."""
+    configured = os.environ.get(ADMIN_SECRET_ENV_VAR)
+    return bool(configured) and bool(provided) and hmac.compare_digest(provided.encode(), configured.encode())
 
 
 def _owner_hash() -> str:
@@ -1377,8 +1387,7 @@ def challenge_status(challenge_id: int):
     """A challenge's own api_key owner can check it, and so can an admin
     -- same visibility rule as /bots/<id>/transactions."""
     provided_admin_secret = request.headers.get("X-Admin-Secret")
-    configured_admin_secret = os.environ.get(ADMIN_SECRET_ENV_VAR)
-    is_admin = bool(configured_admin_secret) and provided_admin_secret == configured_admin_secret
+    is_admin = is_admin_secret(provided_admin_secret)
     with db.connect() as conn:
         challenge = db.get_boss_challenge(conn, challenge_id)
         if challenge is None:
@@ -1511,8 +1520,7 @@ def negotiation_action(negotiation_id: int):
 @app.route("/exams/<int:exam_id>", methods=["GET"])
 def negotiation_exam_report(exam_id: int):
     provided_admin_secret = request.headers.get("X-Admin-Secret")
-    configured_admin_secret = os.environ.get(ADMIN_SECRET_ENV_VAR)
-    is_admin = bool(configured_admin_secret) and provided_admin_secret == configured_admin_secret
+    is_admin = is_admin_secret(provided_admin_secret)
     with _lock:
         with db.connect() as conn:
             exam_row = db.get_negotiation_exam(conn, exam_id)

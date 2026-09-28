@@ -40,7 +40,7 @@ class PlayTest(unittest.TestCase):
 
     def register(self, prefix="bot", ip=None):
         _counter[0] += 1
-        headers = {"X-Forwarded-For": ip} if ip else {}
+        headers = {"X-Real-IP": ip} if ip else {}
         r = self.client.post("/bots", json={"name": f"{prefix}-{_counter[0]}"}, headers=headers)
         self.assertEqual(r.status_code, 201, r.get_json())
         return {"X-API-Key": r.get_json()["api_key"], "name": r.get_json()["name"]}
@@ -281,11 +281,11 @@ class TestSafety(PlayTest):
             old = play.RATE_LIMIT_PER_MINUTE
             play.RATE_LIMIT_PER_MINUTE = 5
             play._hits.clear()
-            codes = [self.client.get("/rules/poker", headers={"X-Forwarded-For": "10.9.9.9"}).status_code for _ in range(7)]
+            codes = [self.client.get("/rules/poker", headers={"X-Real-IP": "10.9.9.9"}).status_code for _ in range(7)]
             self.assertEqual(codes[:5], [200] * 5)
             self.assertEqual(codes[-1], 429)
             play.RATE_LIMIT_PER_MINUTE = old
-            big = self.client.post("/bots", data="x" * 100_000, headers={"Content-Type": "application/json", "X-Forwarded-For": "10.9.9.8"})
+            big = self.client.post("/bots", data="x" * 100_000, headers={"Content-Type": "application/json", "X-Real-IP": "10.9.9.8"})
             self.assertEqual(big.status_code, 413)
         finally:
             self.app.testing = True
@@ -298,6 +298,18 @@ class TestSafety(PlayTest):
             conn.execute("UPDATE bots SET balance = 0 WHERE name = ?", (bot["name"],))
         s = self.client.post("/play", json={"game": "poker", "opponent": "easy"}, headers=self.hdr(bot)).get_json()
         self.assertEqual(s["status"], "your_turn")
+
+    def test_a_forged_forwarded_header_does_not_change_who_you_are(self):
+        with self.app.test_request_context(headers={"X-Forwarded-For": "1.2.3.4", "X-Real-IP": "9.9.9.9"}):
+            self.assertEqual(arena._client_ip(), "9.9.9.9")
+        with self.app.test_request_context(headers={"X-Forwarded-For": "1.2.3.4"}, environ_base={"REMOTE_ADDR": "5.6.7.8"}):
+            self.assertEqual(arena._client_ip(), "5.6.7.8")
+
+    def test_responses_carry_safety_headers(self):
+        r = self.client.get("/")
+        self.assertEqual(r.headers["X-Frame-Options"], "DENY")
+        self.assertIn("frame-ancestors 'none'", r.headers["Content-Security-Policy"])
+        self.assertEqual(self.client.get("/health").headers["X-Content-Type-Options"], "nosniff")
 
     def test_admin_can_upgrade_a_bot(self):
         bot = self.register()

@@ -33,7 +33,6 @@ from collections import defaultdict, deque
 from flask import Response, jsonify, request
 
 from api.app import (
-    ADMIN_SECRET_ENV_VAR,
     DEFAULT_DUEL_STAKE,
     DEFAULT_STARTING_BALANCE,
     HOUSE_RATINGS,
@@ -47,6 +46,7 @@ from api.app import (
     _autoplay_baseline_duel_moves,
     _autoplay_baseline_turns,
     _client_ip,
+    is_admin_secret,
     _get_live,
     _get_live_duel,
     _lock,
@@ -675,8 +675,7 @@ def bot_badge(name: str):
 
 @app.route("/admin/bots/<name>/tier", methods=["POST"])
 def admin_set_tier(name: str):
-    configured = os.environ.get(ADMIN_SECRET_ENV_VAR)
-    if not configured or request.headers.get("X-Admin-Secret") != configured:
+    if not is_admin_secret(request.headers.get("X-Admin-Secret")):
         return jsonify(error="admin secret required"), 401
     tier = str((request.get_json(silent=True) or {}).get("tier", "")).lower()
     if tier not in MAX_MATCHES_AT_ONCE:
@@ -991,6 +990,17 @@ def _cors(resp):
     resp.headers["Access-Control-Allow-Origin"] = "*"
     resp.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization"
     resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    # No content-type guessing, no framing by other sites, no leaking URLs,
+    # HTTPS only; and pages may load nothing from anywhere else.
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Strict-Transport-Security"] = "max-age=31536000"
+    if resp.mimetype == "text/html":
+        resp.headers["Content-Security-Policy"] = (
+            "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; img-src 'self' data:; "
+            "connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+        )
     return resp
 
 
