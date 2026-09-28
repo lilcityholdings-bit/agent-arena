@@ -30,7 +30,7 @@ import re
 import time
 from collections import defaultdict, deque
 
-from flask import Response, jsonify, request
+from flask import Response, g, jsonify, request
 
 from api.app import (
     DEFAULT_DUEL_STAKE,
@@ -137,12 +137,41 @@ def _request_key() -> str | None:
     return request.headers.get("X-API-Key") or (request.get_json(silent=True) or {}).get("api_key")
 
 
+# A waiting request holds one of the server's 64 threads for up to MAX_WAIT
+# seconds. Without a cap, one address opening 64 waits at once would leave no
+# thread for anyone else. Past these caps a request answers right away instead
+# of waiting -- slower for that caller, never a lockout for everyone.
+MAX_WAITS_PER_ADDRESS = 4
+MAX_WAITS_TOTAL = 40
+_waiting: dict[str, int] = defaultdict(int)
+_waiting_lock = __import__("threading").Lock()
+
+
 def _wait_seconds(value) -> float:
     try:
         w = float(value)
     except (TypeError, ValueError):
-        return DEFAULT_WAIT
-    return max(0.0, min(MAX_WAIT, w))
+        w = DEFAULT_WAIT
+    w = max(0.0, min(MAX_WAIT, w)) if w == w else DEFAULT_WAIT  # w != w only for NaN
+    if w <= 0 or getattr(g, "wait_slot", None):
+        return w
+    ip = _client_ip()
+    with _waiting_lock:
+        if _waiting[ip] >= MAX_WAITS_PER_ADDRESS or sum(_waiting.values()) >= MAX_WAITS_TOTAL:
+            return 0.0
+        _waiting[ip] += 1
+    g.wait_slot = ip
+    return w
+
+
+@app.teardown_request
+def _release_wait_slot(_exc=None):
+    ip = g.pop("wait_slot", None)
+    if ip is not None:
+        with _waiting_lock:
+            _waiting[ip] -= 1
+            if _waiting[ip] <= 0:
+                del _waiting[ip]
 
 
 def _game_of_match(match_id: int) -> str | None:

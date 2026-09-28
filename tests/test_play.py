@@ -305,6 +305,25 @@ class TestSafety(PlayTest):
         with self.app.test_request_context(headers={"X-Forwarded-For": "1.2.3.4"}, environ_base={"REMOTE_ADDR": "5.6.7.8"}):
             self.assertEqual(arena._client_ip(), "5.6.7.8")
 
+    def test_one_address_cannot_hold_every_waiting_thread(self):
+        import contextlib
+
+        def request_from(ip, stack):
+            # Its own app context too, as real concurrent requests each have.
+            stack.enter_context(self.app.app_context())
+            stack.enter_context(self.app.test_request_context(headers={"X-Real-IP": ip}))
+            return play._wait_seconds(10)
+
+        with contextlib.ExitStack() as held:
+            for _ in range(play.MAX_WAITS_PER_ADDRESS):
+                self.assertEqual(request_from("7.7.7.8", held), 10)
+            with contextlib.ExitStack() as s:
+                self.assertEqual(request_from("7.7.7.8", s), 0.0, "over the cap: answer at once")
+            with contextlib.ExitStack() as s:
+                self.assertEqual(request_from("7.7.7.9", s), 10, "other callers are unaffected")
+        with contextlib.ExitStack() as s:
+            self.assertEqual(request_from("7.7.7.8", s), 10, "slots come back when requests end")
+
     def test_responses_carry_safety_headers(self):
         r = self.client.get("/")
         self.assertEqual(r.headers["X-Frame-Options"], "DENY")
