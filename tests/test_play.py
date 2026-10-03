@@ -427,5 +427,5 @@ class TestAgentTrust(PlayTest):
     def test_profiles_link_the_trust_score(self):
         bot = self.register()
         p = self.client.get(f"/bots/{bot['name']}").get_json()
-        self.assertTrue(p["bot_trust_bureau"]["profile"].endswith(f"/trust/arena.{bot['name']}"))
-        self.assertIsNone(self.client.get("/bots/random_bot").get_json()["bot_trust_bureau"])
+        self.assertTrue(p["keptvow"]["profile"].endswith(f"/trust/arena.{bot['name']}"))
+        self.assertIsNone(self.client.get("/bots/random_bot").get_json()["keptvow"])
