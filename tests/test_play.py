@@ -385,6 +385,24 @@ class TestAgentTrust(PlayTest):
         self.play_out(short, self.client.post("/play", json={"game": "poker", "opponent": "easy", "length": 3}, headers=self.hdr(short)).get_json())
         self.assertEqual(self.trust_events(short["name"]), [], "too short to rate, so nothing to report")
 
+    def test_each_bot_shows_its_keptvow_standing_without_waiting_for_it(self):
+        import time as _t
+        from api import trust
+        bot = self.register()
+        first = self.client.get(f"/bots/{bot['name']}").get_json()["keptvow"]
+        self.assertIsNone(first["trust_level"], "not looked up yet, and the page didn't wait")
+        self.assertTrue(first["profile"].endswith(f"/trust/arena.{bot['name']}"))
+        trust._levels[bot["name"]] = (_t.time(), "good")
+        self.assertEqual(self.client.get(f"/bots/{bot['name']}").get_json()["keptvow"]["trust_level"], "good")
+        # Its opponent sees it too; the computer has no Keptvow record.
+        other = self.register()
+        trust._levels[other["name"]] = (_t.time(), "caution")
+        self.client.post("/play", json={"game": "poker", "opponent": other["name"]}, headers=self.hdr(bot))
+        view = self.client.post("/play", json={"game": "poker", "opponent": bot["name"]}, headers=self.hdr(other)).get_json()
+        self.assertEqual(view["opponent_keptvow"]["trust_level"], "good", view)
+        vs_computer = self.client.post("/play", json={"game": "duel", "opponent": "easy"}, headers=self.hdr(bot)).get_json()
+        self.assertIsNone(vs_computer["opponent_keptvow"])
+
     def test_the_arena_proves_it_is_the_source_by_publishing_its_secret_hash(self):
         from api import trust
         from ledger import db

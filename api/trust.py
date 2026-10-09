@@ -14,6 +14,12 @@ controls this domain controls the source. agenttrust is told the domain once
 Reports wait in an outbox table and a background thread sends them, so a slow
 or unreachable agenttrust never holds up a match. Nothing is sent until
 agenttrust lists the arena as trusted, so no report is ever wasted.
+
+The other direction: each bot's current Keptvow standing is shown on its
+profile and to its opponent during a match, so a bot can see whether the one
+across the table has a record of finishing what it starts -- here and
+everywhere else Keptvow hears from. Looked up in the background and kept for
+ten minutes, so a match never waits on Keptvow either.
 """
 from __future__ import annotations
 
@@ -32,7 +38,7 @@ from api.app import app
 from ledger import db
 
 SOURCE_NAME = "arena"
-DEFAULT_AGENTTRUST_URL = "https://agenttrust-production-381e.up.railway.app"
+DEFAULT_AGENTTRUST_URL = "https://keptvow.com"
 
 
 def agenttrust_url() -> str | None:
@@ -52,6 +58,54 @@ def trust_links(bot_name: str) -> dict | None:
     sid = subject_for(bot_name)
     return {"id": sid, "profile": f"{base}/trust/{sid}", "api": f"{base}/v1/trust/{sid}",
             "badge": f"{base}/v1/trust/{sid}/badge.svg"}
+
+
+LEVEL_TTL = 600
+_levels: dict[str, tuple[float, str]] = {}
+_fetching: set[str] = set()
+_levels_lock = threading.Lock()
+
+
+def _fetch_level(base: str, bot_name: str) -> None:
+    try:
+        status, j = _http("GET", f"{base}/v1/trust/{subject_for(bot_name)}")
+        level = j.get("trust_level") if status == 200 else ("unknown" if status == 404 else None)
+        if isinstance(level, str):
+            with _levels_lock:
+                if len(_levels) > 50_000:
+                    _levels.clear()
+                _levels[bot_name] = (time.time(), level)
+    except (OSError, ValueError):
+        pass
+    finally:
+        with _levels_lock:
+            _fetching.discard(bot_name)
+
+
+def trust_level(bot_name: str) -> str | None:
+    """The bot's Keptvow level (unknown, caution, fair, good, excellent) as last looked up,
+    or None before the first lookup lands. Never waits: a stale or missing level is refreshed
+    in the background."""
+    base = agenttrust_url()
+    if not base:
+        return None
+    with _levels_lock:
+        known = _levels.get(bot_name)
+        stale = known is None or time.time() - known[0] > LEVEL_TTL
+        start = stale and bot_name not in _fetching and os.environ.get("ARENA_BACKGROUND", "1") != "0"
+        if start:
+            _fetching.add(bot_name)
+    if start:
+        threading.Thread(target=_fetch_level, args=(base, bot_name), daemon=True).start()
+    return known[1] if known else None
+
+
+def standing(bot_name: str) -> dict | None:
+    """What a profile or an opponent sees: the level plus where to read more."""
+    links = trust_links(bot_name)
+    if links is None:
+        return None
+    return {"trust_level": trust_level(bot_name), **links}
 
 
 def _secret(conn) -> str:

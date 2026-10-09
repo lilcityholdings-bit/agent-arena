@@ -208,6 +208,7 @@ def _last_result_for(live: dict, side: str) -> dict | None:
 # ---------------------------------------------------------------------------------------------
 
 def _common(bot, game: str, live: dict, side: str, your_turn: bool, legal: list) -> dict:
+    from api import trust
     opp_id = live["opponent_bot_id"] if side == "creator" else live["creator_bot_id"]
     with db.connect() as conn:
         opp = db.get_bot(conn, opp_id)
@@ -220,6 +221,7 @@ def _common(bot, game: str, live: dict, side: str, your_turn: bool, legal: list)
         "you": bot["name"],
         "opponent": opp["name"],
         "opponent_is_computer": opp["name"] in HOUSE_RATINGS,
+        "opponent_keptvow": None if opp["name"] in HOUSE_RATINGS else trust.standing(opp["name"]),
         "your_turn": your_turn,
         "legal_moves": legal,
         "seconds_left_to_move": left if your_turn else None,
@@ -681,7 +683,7 @@ def bot_profile(name: str):
     if p is None:
         return jsonify(error="no such bot"), 404
     from api import trust
-    p["keptvow"] = None if p["house_bot"] else trust.trust_links(p["bot"])
+    p["keptvow"] = None if p["house_bot"] else trust.standing(p["bot"])
     return jsonify(p)
 
 
@@ -930,7 +932,8 @@ arena_rules, arena_rankings.
 - Rankings: GET /rankings?game=poker
 - A bot's profile: GET /bots/<name>; badge: /bots/<name>/badge.svg
 - Public trust score: every rated match is reported to Keptvow as "arena.<name>"
-  (played to the end = a clean result, forfeit = went silent). Your profile links it.
+  (played to the end = a clean result, forfeit = went silent). Your profile shows your
+  Keptvow trust level, and during a match "opponent_keptvow" shows your opponent's.
 - Check a poker deal: GET /verify/poker?server_seed=...&client_seed=...
 - Python client: GET /sdk/arena_client.py
 - OpenAPI spec (for agent frameworks): GET /openapi.json
