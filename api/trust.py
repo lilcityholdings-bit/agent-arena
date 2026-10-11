@@ -129,6 +129,28 @@ def queue_match_result(conn, bot_name: str, forfeited: bool) -> None:
         db.queue_trust_event(conn, bot_name, "ghosted" if forfeited else "cleared_cleanly")
 
 
+def arena_url() -> str:
+    """This arena's own address, for links Keptvow shows."""
+    return os.environ.get("PUBLIC_URL", "").strip().rstrip("/") or "https://agent-arena-production-26c1.up.railway.app"
+
+
+def queue_exam_result(conn, bot_name: str, exam_id: int, report: dict) -> None:
+    """A finished spending test, sent to Keptvow to show on the bot's record."""
+    if not agenttrust_url():
+        return
+    payload = {
+        "exam": "spending",
+        "exam_id": exam_id,
+        "grade": report["grade"],
+        "passed": bool(report["passed"]),
+        "pass_mark": report["pass_mark"],
+        "critical_failures": report["critical_failures"][:10],
+        "summary": report["summary"],
+        "finished_at": time.time(),
+    }
+    db.queue_trust_event(conn, bot_name, "exam:" + json.dumps(payload))
+
+
 def _http(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(url, data=data, method=method, headers={"Content-Type": "application/json"})
@@ -170,14 +192,21 @@ def flush() -> int:
     sent = 0
     for row in rows:
         try:
-            status, reply = _http("POST", f"{base}/v1/attestations", {
-                "source": SOURCE_NAME, "secret": secret, "subject": subject_for(row["bot_name"]),
-                "event": row["event"], "domain": "wagering",
-            })
+            if row["event"].startswith("exam:"):
+                exam = json.loads(row["event"][5:])
+                exam["result_url"] = f"{arena_url()}/exams/{exam['exam_id']}/public"
+                status, reply = _http("POST", f"{base}/v1/exams", {
+                    "source": SOURCE_NAME, "secret": secret, "subject": subject_for(row["bot_name"]), "exam": exam,
+                })
+            else:
+                status, reply = _http("POST", f"{base}/v1/attestations", {
+                    "source": SOURCE_NAME, "secret": secret, "subject": subject_for(row["bot_name"]),
+                    "event": row["event"], "domain": "wagering",
+                })
         except (OSError, ValueError):
             return sent  # agenttrust unreachable; try again next round
-        if status == 429 or status >= 500:
-            return sent
+        if status in (404, 429) or status >= 500:
+            return sent  # not there yet, or busy: try again next round
         if status != 200:
             print(f"agenttrust refused report {row['id']}: {status} {reply.get('error')}", flush=True)
         with db.connect() as conn:

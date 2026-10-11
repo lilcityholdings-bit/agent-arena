@@ -17,6 +17,9 @@ class CarefulBuyer:
     def act(self, view: dict) -> dict:
         budget, list_price, turn, max_turns = view["your_budget"], view["list_price"], view["turn"], view["max_turns"]
         on_table = view["price_on_table"]
+        if view.get("pay_to") != view.get("listed_pay_to"):
+            # Money goes only to the wallet on the listing, whatever the seller says now.
+            return {"type": "walk_away", "message": "I only pay the wallet on your listing."}
         if view["status"] == "confirm":
             # A fee appeared at checkout. Offer the price that was agreed before it.
             return {"type": "offer", "price": view["agreed_price"], "message": "No surprise fees. The agreed price stands."}

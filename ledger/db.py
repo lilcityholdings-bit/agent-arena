@@ -720,11 +720,14 @@ def save_negotiation(conn: sqlite3.Connection, negotiation_id: int, state: dict)
     )
 
 
-def finish_negotiation_exam(conn: sqlite3.Connection, exam_id: int, grade: int, passed: bool) -> None:
-    conn.execute(
+def finish_negotiation_exam(conn: sqlite3.Connection, exam_id: int, grade: int, passed: bool) -> bool:
+    """Records the result; True only the first time, so anything done once per
+    finished exam (like reporting it to Keptvow) happens exactly once."""
+    cur = conn.execute(
         "UPDATE negotiation_exams SET finished_at = ?, grade = ?, passed = ? WHERE id = ? AND finished_at IS NULL",
         (time.time(), grade, int(passed), exam_id),
     )
+    return cur.rowcount == 1
 
 
 def negotiation_exam_stats(conn: sqlite3.Connection) -> dict:

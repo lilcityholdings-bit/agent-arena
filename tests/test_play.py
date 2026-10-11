@@ -348,7 +348,8 @@ class TestAgentAccess(PlayTest):
         self.assertIn("tools", init["result"]["capabilities"])
         self.assertEqual(self.client.post("/mcp", json={"jsonrpc": "2.0", "method": "notifications/initialized"}).status_code, 202)
         names = [t["name"] for t in self.rpc("tools/list")["result"]["tools"]]
-        self.assertEqual(names, ["arena_register", "arena_play", "arena_move", "arena_status", "arena_rules",
+        self.assertEqual(names, ["arena_register", "arena_play", "arena_move", "arena_status", "arena_spending_test",
+                                 "arena_negotiate", "arena_spending_test_result", "arena_rules",
                                  "arena_rankings", "arena_report", "arena_upgrade"])
         _counter[0] += 1
         reg = self.rpc("tools/call", {"name": "arena_register", "arguments": {"name": f"mcp-bot-{_counter[0]}"}})["result"]
@@ -363,6 +364,23 @@ class TestAgentAccess(PlayTest):
         bad = self.rpc("tools/call", {"name": "arena_play", "arguments": {"game": "poker"}})["result"]
         self.assertTrue(bad["isError"])
         self.assertIn("error", self.rpc("no/such/method"))
+
+    def test_an_ai_assistant_can_take_the_spending_test_over_mcp(self):
+        _counter[0] += 1
+        key = self.rpc("tools/call", {"name": "arena_register", "arguments": {"name": f"mcp-buyer-{_counter[0]}"}})["result"]["structuredContent"]["api_key"]
+        start = self.rpc("tools/call", {"name": "arena_spending_test", "arguments": {"api_key": key}})["result"]
+        self.assertFalse(start["isError"])
+        exam = start["structuredContent"]
+        self.assertEqual(len(exam["negotiations"]), 10)
+        nid = exam["negotiations"][0]["negotiation_id"]
+        seen = self.rpc("tools/call", {"name": "arena_negotiate", "arguments": {"negotiation_id": nid, "api_key": key}})["result"]["structuredContent"]
+        self.assertIn("pay_to", seen)
+        acted = self.rpc("tools/call", {"name": "arena_negotiate", "arguments": {"negotiation_id": nid, "action": {"type": "walk_away"}, "api_key": key}})["result"]["structuredContent"]
+        self.assertEqual(acted["status"], "no_deal")
+        result = self.rpc("tools/call", {"name": "arena_spending_test_result", "arguments": {"exam_id": exam["exam_id"], "api_key": key}})["result"]["structuredContent"]
+        self.assertFalse(result["complete"])
+        again = self.rpc("tools/call", {"name": "arena_spending_test", "arguments": {"api_key": key}})["result"]
+        self.assertTrue(again["isError"], "one test at a time")
 
     def test_agent_docs_are_served(self):
         txt = self.client.get("/llms.txt").get_data(as_text=True)

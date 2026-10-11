@@ -180,11 +180,12 @@ def dashboard():
             f"SELECT COUNT(*) FROM bots WHERE name NOT IN ({','.join('?' * len(HOUSE_RATINGS))})", tuple(HOUSE_RATINGS)
         ).fetchone()[0]
         match_count = conn.execute("SELECT COUNT(*) FROM matches WHERE status = 'completed'").fetchone()[0]
+        exams = db.negotiation_exam_stats(conn)
     for m in matches:
         m["game"] = {"leduc": "poker"}.get(m["game_type"], m["game_type"])
     return render_template(
         "index.html", matches=matches, rankings=rankings, agent_count=agent_count, match_count=match_count,
-        base=request.host_url.rstrip("/"), house=HOUSE_RATINGS, turn_seconds=TURN_SECONDS,
+        base=request.host_url.rstrip("/"), house=HOUSE_RATINGS, turn_seconds=TURN_SECONDS, exams=exams,
     )
 
 
@@ -1434,7 +1435,10 @@ def _exam_payload(conn, exam_row) -> dict:
     states = [st for _, st in items]
     report = negotiation.exam_report(states)
     if report["complete"]:
-        db.finish_negotiation_exam(conn, exam_row["id"], report["grade"], report["passed"])
+        if db.finish_negotiation_exam(conn, exam_row["id"], report["grade"], report["passed"]):
+            bot_row = db.get_bot(conn, exam_row["bot_id"])
+            if bot_row is not None:
+                trust.queue_exam_result(conn, bot_row["name"], exam_row["id"], report)
     report["exam_id"] = exam_row["id"]
     report["negotiation_ids"] = [
         {"negotiation_id": nid, "item": st["scenario"]["item"], "status": st["status"]} for nid, st in items
@@ -1443,28 +1447,25 @@ def _exam_payload(conn, exam_row) -> dict:
     return report
 
 
-@app.route("/exams/negotiation", methods=["POST"])
-def start_negotiation_exam():
-    bot, err = _require_bot()
-    if err:
-        return err
+def exam_start(bot) -> tuple[dict, int]:
+    """Starts a fresh spending test for `bot` (or says which one to finish first)."""
     with _lock:
         with db.connect() as conn:
             open_id = db.open_negotiation_exam_for_bot(conn, bot["id"])
             if open_id is not None:
                 exam_row = db.get_negotiation_exam(conn, open_id)
                 if not _exam_payload(conn, exam_row)["complete"]:
-                    return jsonify(error="finish your current exam first", exam_id=open_id), 409
+                    return {"error": "finish your current exam first", "exam_id": open_id}, 409
             # A fresh random exam every time, so answers can't be memorized.
             seed = random.SystemRandom().randrange(1 << 31)
             now = time.time()
             states = [negotiation.new_negotiation(sc, now) for sc in negotiation.exam_scenarios(seed)]
             exam_id = db.create_negotiation_exam(conn, bot["id"], seed, states)
             items = db.exam_negotiations(conn, exam_id)
-    return jsonify(
-        exam_id=exam_id,
-        how_to_play=HOW_TO_PLAY,
-        negotiations=[
+    return {
+        "exam_id": exam_id,
+        "how_to_play": HOW_TO_PLAY,
+        "negotiations": [
             {
                 "negotiation_id": nid,
                 "item": st["scenario"]["item"],
@@ -1473,7 +1474,61 @@ def start_negotiation_exam():
             }
             for nid, st in items
         ],
-    ), 201
+    }, 201
+
+
+def negotiation_get(bot, negotiation_id: int) -> tuple[dict, int]:
+    with _lock:
+        with db.connect() as conn:
+            found = db.get_negotiation(conn, negotiation_id)
+            row, state = found if found else (None, None)
+            if row is None:
+                return {"error": "no such negotiation"}, 404
+            if row["bot_id"] != bot["id"]:
+                return {"error": "not your negotiation"}, 403
+            now = time.time()
+            if negotiation.expire_if_stale(state, now):
+                db.save_negotiation(conn, negotiation_id, state)
+    return {"negotiation_id": negotiation_id, "exam_id": row["exam_id"], **negotiation.view(state, now)}, 200
+
+
+def negotiation_do(bot, negotiation_id: int, body: dict) -> tuple[dict, int]:
+    with _lock:
+        with db.connect() as conn:
+            found = db.get_negotiation(conn, negotiation_id)
+            row, state = found if found else (None, None)
+            if row is None:
+                return {"error": "no such negotiation"}, 404
+            if row["bot_id"] != bot["id"]:
+                return {"error": "not your negotiation"}, 403
+            now = time.time()
+            try:
+                negotiation.act(state, body, now)
+            except negotiation.IllegalAction as exc:
+                db.save_negotiation(conn, negotiation_id, state)  # keeps a timeout, if that's what happened
+                return {"error": str(exc), **negotiation.view(state, now)}, 400
+            db.save_negotiation(conn, negotiation_id, state)
+    return {"negotiation_id": negotiation_id, "exam_id": row["exam_id"], **negotiation.view(state, now)}, 200
+
+
+def exam_get(bot, exam_id: int, is_admin: bool = False) -> tuple[dict, int]:
+    with _lock:
+        with db.connect() as conn:
+            exam_row = db.get_negotiation_exam(conn, exam_id)
+            if exam_row is None:
+                return {"error": "no such exam"}, 404
+            if not is_admin and (bot is None or bot["id"] != exam_row["bot_id"]):
+                return {"error": "not your exam"}, 403
+            return _exam_payload(conn, exam_row), 200
+
+
+@app.route("/exams/negotiation", methods=["POST"])
+def start_negotiation_exam():
+    bot, err = _require_bot()
+    if err:
+        return err
+    payload, code = exam_start(bot)
+    return jsonify(payload), code
 
 
 @app.route("/negotiations/<int:negotiation_id>", methods=["GET"])
@@ -1481,17 +1536,8 @@ def negotiation_state(negotiation_id: int):
     bot, err = _require_bot()
     if err:
         return err
-    with _lock:
-        with db.connect() as conn:
-            found = db.get_negotiation(conn, negotiation_id)
-            row, state = found if found else (None, None)
-            denied = _negotiation_owner_check(row, bot)
-            if denied:
-                return denied
-            now = time.time()
-            if negotiation.expire_if_stale(state, now):
-                db.save_negotiation(conn, negotiation_id, state)
-    return jsonify(negotiation_id=negotiation_id, exam_id=row["exam_id"], **negotiation.view(state, now))
+    payload, code = negotiation_get(bot, negotiation_id)
+    return jsonify(payload), code
 
 
 @app.route("/negotiations/<int:negotiation_id>/action", methods=["POST"])
@@ -1499,40 +1545,20 @@ def negotiation_action(negotiation_id: int):
     bot, err = _require_bot()
     if err:
         return err
-    body = request.get_json(silent=True) or {}
-    with _lock:
-        with db.connect() as conn:
-            found = db.get_negotiation(conn, negotiation_id)
-            row, state = found if found else (None, None)
-            denied = _negotiation_owner_check(row, bot)
-            if denied:
-                return denied
-            now = time.time()
-            try:
-                negotiation.act(state, body, now)
-            except negotiation.IllegalAction as exc:
-                db.save_negotiation(conn, negotiation_id, state)  # keeps a timeout, if that's what happened
-                return jsonify(error=str(exc), **negotiation.view(state, now)), 400
-            db.save_negotiation(conn, negotiation_id, state)
-    return jsonify(negotiation_id=negotiation_id, exam_id=row["exam_id"], **negotiation.view(state, now))
+    payload, code = negotiation_do(bot, negotiation_id, request.get_json(silent=True) or {})
+    return jsonify(payload), code
 
 
 @app.route("/exams/<int:exam_id>", methods=["GET"])
 def negotiation_exam_report(exam_id: int):
-    provided_admin_secret = request.headers.get("X-Admin-Secret")
-    is_admin = is_admin_secret(provided_admin_secret)
-    with _lock:
-        with db.connect() as conn:
-            exam_row = db.get_negotiation_exam(conn, exam_id)
-            if exam_row is None:
-                return jsonify(error="no such exam"), 404
-            if not is_admin:
-                bot, err = _require_bot()
-                if err:
-                    return err
-                if bot["id"] != exam_row["bot_id"]:
-                    return jsonify(error="not your exam"), 403
-            return jsonify(_exam_payload(conn, exam_row))
+    if is_admin_secret(request.headers.get("X-Admin-Secret")):
+        payload, code = exam_get(None, exam_id, is_admin=True)
+        return jsonify(payload), code
+    bot, err = _require_bot()
+    if err:
+        return err
+    payload, code = exam_get(bot, exam_id)
+    return jsonify(payload), code
 
 
 @app.route("/exams/<int:exam_id>/public", methods=["GET"])
